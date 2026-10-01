@@ -1,0 +1,16 @@
+import { Router } from 'express';
+import { login, getDashboard, getCustomers, getWorkers, getTransactions, getGroups, getNotifications } from './admin.controller';
+import { authMiddleware } from '../../middlewares/auth.middleware';
+import { roleMiddleware } from '../../middlewares/role.middleware';
+import { Role } from '@prisma/client';
+const router = Router();
+router.post('/auth/login', login);
+router.use(authMiddleware);
+router.use(roleMiddleware([Role.ADMIN, Role.SUPER_ADMIN]));
+router.get('/dashboard', getDashboard);
+router.get('/customers', getCustomers);
+router.get('/workers', getWorkers);
+router.get('/transactions', getTransactions);
+router.get('/groups', getGroups);
+router.get('/notifications', getNotifications);
+export default router;

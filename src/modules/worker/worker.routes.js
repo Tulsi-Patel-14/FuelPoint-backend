@@ -1,0 +1,16 @@
+import { Router } from 'express';
+import { login, getProfile, scanQR, redeemTransaction, cancelTransaction, getTransactions, getTodaySummary } from './worker.controller';
+import { authMiddleware } from '../../middlewares/auth.middleware';
+import { roleMiddleware } from '../../middlewares/role.middleware';
+import { Role } from '@prisma/client';
+const router = Router();
+router.post('/auth/login', login);
+router.use(authMiddleware);
+router.use(roleMiddleware([Role.WORKER]));
+router.get('/profile', getProfile);
+router.post('/qr/validate', scanQR);
+router.post('/transactions/redeem', redeemTransaction);
+router.post('/transactions/:id/cancel', cancelTransaction);
+router.get('/transactions', getTransactions);
+router.get('/transactions/today-summary', getTodaySummary);
+export default router;

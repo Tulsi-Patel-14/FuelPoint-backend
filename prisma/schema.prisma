@@ -1,0 +1,162 @@
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+enum Role {
+  CUSTOMER
+  WORKER
+  ADMIN
+  SUPER_ADMIN
+}
+
+enum AccountStatus {
+  PENDING
+  ACTIVE
+  SUSPENDED
+  INACTIVE
+}
+
+enum FuelType {
+  Petrol
+  Diesel
+  CNG
+}
+
+enum TransactionStatus {
+  PENDING
+  COMPLETED
+  FAILED
+  CANCELLED
+}
+
+model User {
+  id        String        @id @default(uuid())
+  mobile    String?       @unique
+  email     String?       @unique
+  password  String?
+  role      Role          @default(CUSTOMER)
+  status    AccountStatus @default(ACTIVE)
+  createdAt DateTime      @default(now())
+  updatedAt DateTime      @updatedAt
+
+  customerProfile CustomerProfile?
+  workerProfile   WorkerProfile?
+  adminProfile    AdminProfile?
+
+  notifications Notification[]
+}
+
+model Group {
+  id              String   @id @default(uuid())
+  name            String
+  discountPercent Float
+  description     String?
+  active          Boolean  @default(true)
+  isDefault       Boolean  @default(false)
+  createdAt       DateTime @default(now())
+  updatedAt       DateTime @updatedAt
+
+  customers CustomerProfile[]
+}
+
+model CustomerProfile {
+  id           String   @id @default(uuid())
+  userId       String   @unique
+  user         User     @relation(fields: [userId], references: [id])
+  fullName     String
+  vehicle      String?
+  groupId      String?
+  group        Group?   @relation(fields: [groupId], references: [id])
+  address      String?
+  profilePhoto String?
+  joinedAt     DateTime @default(now())
+
+  transactions Transaction[]
+  qrSessions   QRSession[]
+}
+
+model WorkerProfile {
+  id        String   @id @default(uuid())
+  userId    String   @unique
+  user      User     @relation(fields: [userId], references: [id])
+  fullName  String
+  shift     String?
+  stationId String?
+  station   Station? @relation(fields: [stationId], references: [id])
+  joinedAt  DateTime @default(now())
+  scans     Int      @default(0)
+
+  transactions Transaction[]
+}
+
+model AdminProfile {
+  id        String   @id @default(uuid())
+  userId    String   @unique
+  user      User     @relation(fields: [userId], references: [id])
+  fullName  String
+  location  String?
+}
+
+model Station {
+  id           String   @id @default(uuid())
+  name         String
+  latitude     Float
+  longitude    Float
+  radiusMeters Float    @default(150)
+  active       Boolean  @default(true)
+  createdAt    DateTime @default(now())
+
+  workers      WorkerProfile[]
+  transactions Transaction[]
+}
+
+model QRSession {
+  id          String   @id @default(uuid())
+  token       String   @unique
+  customerId  String
+  customer    CustomerProfile @relation(fields: [customerId], references: [id])
+  stationId   String?
+  expiresAt   DateTime
+  consumedAt  DateTime?
+  status      String   @default("ACTIVE")
+  createdAt   DateTime @default(now())
+}
+
+model Transaction {
+  id              String            @id @default(uuid())
+  customerId      String
+  customer        CustomerProfile   @relation(fields: [customerId], references: [id])
+  workerId        String
+  worker          WorkerProfile     @relation(fields: [workerId], references: [id])
+  stationId       String
+  station         Station           @relation(fields: [stationId], references: [id])
+  
+  fuelType        FuelType
+  litres          Float
+  amount          Float
+  discountPercent Float
+  discountAmount  Float
+  finalAmount     Float
+  
+  status          TransactionStatus @default(COMPLETED)
+  idempotencyKey  String?           @unique
+  createdAt       DateTime          @default(now())
+  updatedAt       DateTime          @updatedAt
+}
+
+model Notification {
+  id        String   @id @default(uuid())
+  userId    String?
+  user      User?    @relation(fields: [userId], references: [id])
+  type      String
+  title     String
+  message   String
+  read      Boolean  @default(false)
+  createdAt DateTime @default(now())
+}
+
