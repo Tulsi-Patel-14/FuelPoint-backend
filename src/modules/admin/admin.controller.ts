@@ -80,6 +80,9 @@ export const getCustomers = async (req: Request, res: Response, next: NextFuncti
 export const getWorkers = async (req: Request, res: Response, next: NextFunction) => {
   try {
     const workers = await prisma.workerProfile.findMany({
+      where: {
+        isDeleted: false
+      },
       include: { user: true, station: true }
     });
     res.status(200).json({ success: true, data: workers });
@@ -152,7 +155,7 @@ export const getWorkerById = async (req: Request, res: Response, next: NextFunct
       include: { user: true, station: true }
     });
 
-    if (!worker) {
+    if (!worker || worker.isDeleted) {
       return res.status(404).json({ success: false, message: 'Worker not found' });
     }
 
@@ -176,6 +179,22 @@ export const updateWorker = async (req: Request, res: Response, next: NextFuncti
       return res.status(404).json({ success: false, message: 'Worker not found' });
     }
 
+    // Check for email or mobile uniqueness excluding current user
+    if (email || mobile) {
+      const existingUser = await prisma.user.findFirst({
+        where: {
+          id: { not: workerProfile.userId },
+          OR: [
+            ...(email ? [{ email }] : []),
+            ...(mobile ? [{ mobile }] : [])
+          ]
+        }
+      });
+      if (existingUser) {
+        return res.status(409).json({ success: false, message: 'Email or mobile already in use by another user' });
+      }
+    }
+
     let hashedPassword = undefined;
     if (password) {
       hashedPassword = await bcrypt.hash(password, 10);
@@ -192,7 +211,7 @@ export const updateWorker = async (req: Request, res: Response, next: NextFuncti
             email: email !== undefined ? email : undefined,
             mobile: mobile !== undefined ? mobile : undefined,
             ...(hashedPassword && { password: hashedPassword }),
-            ...(status && { status })
+            ...(status && { status: status.toUpperCase() })
           }
         }
       },
@@ -201,6 +220,7 @@ export const updateWorker = async (req: Request, res: Response, next: NextFuncti
 
     res.status(200).json({ success: true, data: updatedWorker });
   } catch (error) {
+    console.error("Error in updateWorker:", error);
     next(error);
   }
 };
@@ -213,13 +233,19 @@ export const deleteWorker = async (req: Request, res: Response, next: NextFuncti
       where: { id }
     });
 
-    if (!workerProfile) {
+    if (!workerProfile || workerProfile.isDeleted) {
       return res.status(404).json({ success: false, message: 'Worker not found' });
     }
 
     await prisma.$transaction([
-      prisma.workerProfile.delete({ where: { id } }),
-      prisma.user.delete({ where: { id: workerProfile.userId } })
+      prisma.workerProfile.update({
+        where: { id },
+        data: { isDeleted: true }
+      }),
+      prisma.user.update({
+        where: { id: workerProfile.userId },
+        data: { status: 'INACTIVE' }
+      })
     ]);
 
     res.status(200).json({ success: true, message: 'Worker deleted successfully' });
