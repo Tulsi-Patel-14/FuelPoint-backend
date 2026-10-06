@@ -19,7 +19,7 @@ export const login = async (req: Request, res: Response, next: NextFunction) => 
     });
 
     if (!user) {
-      const defaultGroup = await prisma.group.findFirst({ where: { isDefault: true } });
+      const defaultGroup = await prisma.group.findFirst({ where: { isDefault: true, isDeleted: false } });
       user = await prisma.user.create({
         data: {
           mobile,

@@ -383,8 +383,69 @@ export const getTransactions = async (req: Request, res: Response, next: NextFun
 
 export const getGroups = async (req: Request, res: Response, next: NextFunction) => {
   try {
-    const groups = await prisma.group.findMany();
-    res.status(200).json({ success: true, data: groups });
+    const groups = await prisma.group.findMany({
+      where: { isDeleted: false },
+      include: {
+        customers: {
+          where: { isDeleted: false },
+          select: {
+            id: true,
+            transactions: {
+              where: { status: 'COMPLETED' },
+              select: {
+                id: true,
+                amount: true,
+                discountAmount: true,
+              }
+            }
+          }
+        }
+      },
+      orderBy: { createdAt: 'asc' }
+    });
+
+    const totalGroupedCustomers = await prisma.customerProfile.count({
+      where: { isDeleted: false, groupId: { not: null } }
+    });
+
+    let overallDiscountGenerated = 0;
+
+    const data = groups.map(g => {
+      let groupTransactions = 0;
+      let groupDiscount = 0;
+      for (const customer of g.customers) {
+        groupTransactions += customer.transactions.length;
+        for (const txn of customer.transactions) {
+          groupDiscount += (txn.discountAmount || 0);
+        }
+      }
+      overallDiscountGenerated += groupDiscount;
+
+      return {
+        id: g.id,
+        name: g.name,
+        discountPercent: g.discountPercent,
+        description: g.description,
+        active: g.active,
+        isDefault: g.isDefault,
+        createdAt: g.createdAt,
+        updatedAt: g.updatedAt,
+        customersCount: g.customers.length,
+        transactionsCount: groupTransactions,
+        discountGenerated: groupDiscount,
+      };
+    });
+
+    res.status(200).json({
+      success: true,
+      data,
+      stats: {
+        totalGroups: groups.length,
+        activeGroups: groups.filter(g => g.active).length,
+        groupedCustomers: totalGroupedCustomers,
+        discountGenerated: overallDiscountGenerated,
+      }
+    });
   } catch (error) {
     next(error);
   }
@@ -559,8 +620,30 @@ export const deleteCustomer = async (req: Request, res: Response, next: NextFunc
 export const createGroup = async (req: Request, res: Response, next: NextFunction) => {
   try {
     const { name, discountPercent, description, isDefault } = req.body;
-    const group = await prisma.group.create({ data: { name, discountPercent, description, isDefault } });
-    res.status(201).json({ success: true, data: group });
+    if (!name || typeof name !== 'string' || !name.trim()) {
+      return res.status(400).json({ success: false, message: 'Group name is required' });
+    }
+    const parsedDiscount = parseFloat(discountPercent);
+    if (isNaN(parsedDiscount) || parsedDiscount < 0 || parsedDiscount > 100) {
+      return res.status(400).json({ success: false, message: 'Discount percentage must be between 0 and 100' });
+    }
+    const group = await prisma.group.create({
+      data: {
+        name: name.trim(),
+        discountPercent: parsedDiscount,
+        description: description ? description.trim() : null,
+        isDefault: Boolean(isDefault),
+      }
+    });
+    res.status(201).json({
+      success: true,
+      data: {
+        ...group,
+        customersCount: 0,
+        transactionsCount: 0,
+        discountGenerated: 0,
+      }
+    });
   } catch (error) { next(error); }
 };
 
@@ -568,27 +651,129 @@ export const updateGroup = async (req: Request, res: Response, next: NextFunctio
   try {
     const id = req.params.id as string;
     const { name, discountPercent, description, isDefault, active } = req.body;
+    const data: any = {};
+    if (name !== undefined) {
+      if (!name || typeof name !== 'string' || !name.trim()) {
+        return res.status(400).json({ success: false, message: 'Group name is required' });
+      }
+      data.name = name.trim();
+    }
+    if (discountPercent !== undefined) {
+      const parsedDiscount = parseFloat(discountPercent);
+      if (isNaN(parsedDiscount) || parsedDiscount < 0 || parsedDiscount > 100) {
+        return res.status(400).json({ success: false, message: 'Discount percentage must be between 0 and 100' });
+      }
+      data.discountPercent = parsedDiscount;
+    }
+    if (description !== undefined) {
+      data.description = description ? description.trim() : null;
+    }
+    if (isDefault !== undefined) {
+      data.isDefault = Boolean(isDefault);
+    }
+    if (active !== undefined) {
+      data.active = Boolean(active);
+    }
     const group = await prisma.group.update({
-      where: { id }, data: { name, discountPercent, description, isDefault, active }
+      where: { id },
+      data,
+      include: {
+        customers: {
+          where: { isDeleted: false },
+          select: {
+            id: true,
+            transactions: {
+              where: { status: 'COMPLETED' },
+              select: { amount: true, discountAmount: true }
+            }
+          }
+        }
+      }
     });
-    res.status(200).json({ success: true, data: group });
+
+    let groupTransactions = 0;
+    let groupDiscount = 0;
+    for (const customer of group.customers) {
+      groupTransactions += customer.transactions.length;
+      for (const txn of customer.transactions) {
+        groupDiscount += (txn.discountAmount || 0);
+      }
+    }
+
+    res.status(200).json({
+      success: true,
+      data: {
+        id: group.id,
+        name: group.name,
+        discountPercent: group.discountPercent,
+        description: group.description,
+        active: group.active,
+        isDefault: group.isDefault,
+        createdAt: group.createdAt,
+        updatedAt: group.updatedAt,
+        customersCount: group.customers.length,
+        transactionsCount: groupTransactions,
+        discountGenerated: groupDiscount,
+      }
+    });
   } catch (error) { next(error); }
 };
 
 export const toggleGroupActive = async (req: Request, res: Response, next: NextFunction) => {
   try {
     const id = req.params.id as string;
-    const group = await prisma.group.findUnique({ where: { id } });
+    const group = await prisma.group.findUnique({
+      where: { id },
+      include: {
+        customers: {
+          where: { isDeleted: false },
+          select: {
+            id: true,
+            transactions: {
+              where: { status: 'COMPLETED' },
+              select: { amount: true, discountAmount: true }
+            }
+          }
+        }
+      }
+    });
     if (!group) return res.status(404).json({ success: false, message: 'Group not found' });
     const updated = await prisma.group.update({ where: { id }, data: { active: !group.active } });
-    res.status(200).json({ success: true, data: updated });
+
+    let groupTransactions = 0;
+    let groupDiscount = 0;
+    for (const customer of group.customers) {
+      groupTransactions += customer.transactions.length;
+      for (const txn of customer.transactions) {
+        groupDiscount += (txn.discountAmount || 0);
+      }
+    }
+
+    res.status(200).json({
+      success: true,
+      data: {
+        ...updated,
+        customersCount: group.customers.length,
+        transactionsCount: groupTransactions,
+        discountGenerated: groupDiscount,
+      }
+    });
   } catch (error) { next(error); }
 };
 
 export const deleteGroup = async (req: Request, res: Response, next: NextFunction) => {
   try {
     const id = req.params.id as string;
-    await prisma.group.delete({ where: { id } });
+    // Safely unassign customers from this group first
+    await prisma.customerProfile.updateMany({
+      where: { groupId: id },
+      data: { groupId: null }
+    });
+    // Soft delete: update isDeleted to true in database
+    await prisma.group.update({
+      where: { id },
+      data: { isDeleted: true, active: false }
+    });
     res.status(200).json({ success: true, message: 'Group deleted' });
   } catch (error) { next(error); }
 };
