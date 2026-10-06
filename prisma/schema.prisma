@@ -76,6 +76,7 @@ model CustomerProfile {
   address      String?
   profilePhoto String?
   joinedAt     DateTime @default(now())
+  isDeleted    Boolean  @default(false)
 
   transactions Transaction[]
   qrSessions   QRSession[]
