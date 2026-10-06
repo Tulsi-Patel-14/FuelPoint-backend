@@ -71,7 +71,14 @@ export const getCustomers = async (req: Request, res: Response, next: NextFuncti
       }
       const customers = await prisma.customerProfile.findMany({
         where: whereClause,
-        include: { user: true, group: true }
+        include: { 
+          user: true, 
+          group: true,
+          transactions: {
+            where: { status: 'COMPLETED' },
+            include: { worker: true }
+          }
+        }
       });
       res.status(200).json({ success: true, data: customers });
     } catch (error) {
