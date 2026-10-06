@@ -144,13 +144,147 @@ export const getCustomers = async (req: Request, res: Response, next: NextFuncti
 
 export const getWorkers = async (req: Request, res: Response, next: NextFunction) => {
   try {
-    const workers = await prisma.workerProfile.findMany({
-      where: {
-        isDeleted: false
-      },
-      include: { user: true, station: true }
+    const page = Math.max(1, parseInt(req.query.page as string) || 1);
+    const limit = Math.max(1, parseInt((req.query.limit || req.query.pageSize) as string) || 10);
+    const isAll = req.query.all === 'true' || req.query.limit === '-1' || req.query.limit === '0';
+    const skip = (page - 1) * limit;
+
+    const { search, query: qSearch, q, status, shift, sortBy, sortOrder } = req.query;
+    const searchTerm = (search || qSearch || q) as string;
+    const orderDir = ((sortOrder as string)?.toLowerCase() === 'asc' ? 'asc' : 'desc') as 'asc' | 'desc';
+    const sortField = ((sortBy as string)?.toLowerCase() || 'joinedat');
+
+    const whereClause: any = { isDeleted: false };
+
+    // 1. Search filter: fullName, id, user.email, user.mobile
+    if (searchTerm && typeof searchTerm === 'string' && searchTerm.trim()) {
+      const s = searchTerm.trim();
+      whereClause.OR = [
+        { fullName: { contains: s, mode: 'insensitive' } },
+        { id: { contains: s, mode: 'insensitive' } },
+        { user: { email: { contains: s, mode: 'insensitive' } } },
+        { user: { mobile: { contains: s, mode: 'insensitive' } } },
+      ];
+    }
+
+    // 2. Status filter
+    const validStatuses = ['PENDING', 'ACTIVE', 'SUSPENDED', 'INACTIVE', 'OFFLINE'];
+    if (status && typeof status === 'string' && status !== 'all') {
+      const upperStatus = status.toUpperCase();
+      if (validStatuses.includes(upperStatus)) {
+        whereClause.user = {
+          ...(whereClause.user || {}),
+          status: upperStatus
+        };
+      }
+    }
+
+    // 3. Shift filter
+    if (shift && typeof shift === 'string' && shift !== 'all') {
+      whereClause.shift = { equals: shift, mode: 'insensitive' };
+    }
+
+    const formatWorkerItem = (w: any) => {
+      const txns = w.transactions || [];
+      const discount = txns.reduce((sum: number, t: any) => sum + (t.discountAmount || 0), 0);
+      const customers = new Set(txns.map((t: any) => t.customerId)).size;
+      let lastAct = w.joinedAt;
+      if (txns.length > 0) {
+        const sortedTxns = [...txns].sort((a: any, b: any) => new Date(b.createdAt).getTime() - new Date(a.createdAt).getTime());
+        lastAct = sortedTxns[0].createdAt;
+      }
+      return {
+        ...w,
+        transactions: txns.length,
+        discountProcessed: discount,
+        customersScanned: customers,
+        lastActivity: lastAct,
+      };
+    };
+
+    const isComputedSort = ['discount', 'customers', 'last', 'lastactivity'].includes(sortField);
+
+    let workers: any[] = [];
+    let total = 0;
+
+    if (isComputedSort) {
+      const allMatching = await prisma.workerProfile.findMany({
+        where: whereClause,
+        include: {
+          user: true,
+          station: true,
+          transactions: {
+            where: { status: 'COMPLETED' },
+            select: { id: true, customerId: true, amount: true, discountAmount: true, createdAt: true }
+          }
+        }
+      });
+      total = allMatching.length;
+      const formatted = allMatching.map(formatWorkerItem);
+      formatted.sort((a: any, b: any) => {
+        let valA: any = 0;
+        let valB: any = 0;
+        if (sortField === 'discount') {
+          valA = a.discountProcessed || 0;
+          valB = b.discountProcessed || 0;
+        } else if (sortField === 'customers') {
+          valA = a.customersScanned || 0;
+          valB = b.customersScanned || 0;
+        } else if (sortField === 'last' || sortField === 'lastactivity') {
+          valA = new Date(a.lastActivity).getTime();
+          valB = new Date(b.lastActivity).getTime();
+        }
+        return orderDir === 'asc' ? (valA > valB ? 1 : valA < valB ? -1 : 0) : (valA < valB ? 1 : valA > valB ? -1 : 0);
+      });
+      workers = isAll ? formatted : formatted.slice(skip, skip + limit);
+    } else {
+      let orderBy: any = { joinedAt: 'desc' };
+      if (sortField === 'name' || sortField === 'fullname') {
+        orderBy = { fullName: orderDir };
+      } else if (sortField === 'status') {
+        orderBy = { user: { status: orderDir } };
+      } else if (sortField === 'shift') {
+        orderBy = { shift: orderDir };
+      } else if (sortField === 'scans') {
+        orderBy = { scans: orderDir };
+      } else if (sortField === 'transactions') {
+        orderBy = { transactions: { _count: orderDir } };
+      } else if (sortField === 'joinedat') {
+        orderBy = { joinedAt: orderDir };
+      }
+
+      const [rawWorkers, count] = await Promise.all([
+        prisma.workerProfile.findMany({
+          where: whereClause,
+          include: {
+            user: true,
+            station: true,
+            transactions: {
+              where: { status: 'COMPLETED' },
+              select: { id: true, customerId: true, amount: true, discountAmount: true, createdAt: true }
+            }
+          },
+          orderBy,
+          ...(isAll ? {} : { skip, take: limit })
+        }),
+        prisma.workerProfile.count({ where: whereClause })
+      ]);
+      total = count;
+      workers = rawWorkers.map(formatWorkerItem);
+    }
+
+    const totalPages = isAll ? 1 : (Math.ceil(total / limit) || 1);
+
+    res.status(200).json({
+      success: true,
+      data: workers,
+      pagination: {
+        page: isAll ? 1 : page,
+        limit: isAll ? total : limit,
+        total,
+        totalPages
+      }
     });
-    res.status(200).json({ success: true, data: workers });
   } catch (error) {
     next(error);
   }
