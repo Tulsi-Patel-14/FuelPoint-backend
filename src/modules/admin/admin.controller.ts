@@ -80,9 +80,175 @@ export const getCustomers = async (req: Request, res: Response, next: NextFuncti
 export const getWorkers = async (req: Request, res: Response, next: NextFunction) => {
   try {
     const workers = await prisma.workerProfile.findMany({
+      where: {
+        isDeleted: false
+      },
       include: { user: true, station: true }
     });
     res.status(200).json({ success: true, data: workers });
+  } catch (error) {
+    next(error);
+  }
+};
+
+export const createWorker = async (req: Request, res: Response, next: NextFunction) => {
+  try {
+    const { fullName, email, mobile, password, shift, stationId } = req.body;
+
+    if (!fullName) {
+      return res.status(400).json({ success: false, message: 'Full name is required' });
+    }
+
+    if (email || mobile) {
+      const existingUser = await prisma.user.findFirst({
+        where: {
+          OR: [
+            ...(email ? [{ email }] : []),
+            ...(mobile ? [{ mobile }] : [])
+          ]
+        }
+      });
+      if (existingUser) {
+        return res.status(409).json({ success: false, message: 'User with this email or mobile already exists' });
+      }
+    }
+
+    let hashedPassword = undefined;
+    if (password) {
+      hashedPassword = await bcrypt.hash(password, 10);
+    }
+
+    const worker = await prisma.user.create({
+      data: {
+        email,
+        mobile,
+        password: hashedPassword,
+        role: 'WORKER',
+        workerProfile: {
+          create: {
+            fullName,
+            shift,
+            stationId
+          }
+        }
+      },
+      include: {
+        workerProfile: {
+          include: {
+            station: true
+          }
+        }
+      }
+    });
+
+    res.status(201).json({ success: true, data: worker.workerProfile });
+  } catch (error) {
+    next(error);
+  }
+};
+
+export const getWorkerById = async (req: Request, res: Response, next: NextFunction) => {
+  try {
+    const id = req.params.id as string;
+    const worker = await prisma.workerProfile.findUnique({
+      where: { id },
+      include: { user: true, station: true }
+    });
+
+    if (!worker || worker.isDeleted) {
+      return res.status(404).json({ success: false, message: 'Worker not found' });
+    }
+
+    res.status(200).json({ success: true, data: worker });
+  } catch (error) {
+    next(error);
+  }
+};
+
+export const updateWorker = async (req: Request, res: Response, next: NextFunction) => {
+  try {
+    const id = req.params.id as string;
+    const { fullName, email, mobile, password, shift, stationId, status } = req.body;
+
+    const workerProfile = await prisma.workerProfile.findUnique({
+      where: { id },
+      include: { user: true }
+    });
+
+    if (!workerProfile) {
+      return res.status(404).json({ success: false, message: 'Worker not found' });
+    }
+
+    // Check for email or mobile uniqueness excluding current user
+    if (email || mobile) {
+      const existingUser = await prisma.user.findFirst({
+        where: {
+          id: { not: workerProfile.userId },
+          OR: [
+            ...(email ? [{ email }] : []),
+            ...(mobile ? [{ mobile }] : [])
+          ]
+        }
+      });
+      if (existingUser) {
+        return res.status(409).json({ success: false, message: 'Email or mobile already in use by another user' });
+      }
+    }
+
+    let hashedPassword = undefined;
+    if (password) {
+      hashedPassword = await bcrypt.hash(password, 10);
+    }
+
+    const updatedWorker = await prisma.workerProfile.update({
+      where: { id },
+      data: {
+        fullName: fullName !== undefined ? fullName : undefined,
+        shift: shift !== undefined ? shift : undefined,
+        stationId: stationId !== undefined ? stationId : undefined,
+        user: {
+          update: {
+            email: email !== undefined ? email : undefined,
+            mobile: mobile !== undefined ? mobile : undefined,
+            ...(hashedPassword && { password: hashedPassword }),
+            ...(status && { status: status.toUpperCase() })
+          }
+        }
+      },
+      include: { user: true, station: true }
+    });
+
+    res.status(200).json({ success: true, data: updatedWorker });
+  } catch (error) {
+    console.error("Error in updateWorker:", error);
+    next(error);
+  }
+};
+
+export const deleteWorker = async (req: Request, res: Response, next: NextFunction) => {
+  try {
+    const id = req.params.id as string;
+
+    const workerProfile = await prisma.workerProfile.findUnique({
+      where: { id }
+    });
+
+    if (!workerProfile || workerProfile.isDeleted) {
+      return res.status(404).json({ success: false, message: 'Worker not found' });
+    }
+
+    await prisma.$transaction([
+      prisma.workerProfile.update({
+        where: { id },
+        data: { isDeleted: true }
+      }),
+      prisma.user.update({
+        where: { id: workerProfile.userId },
+        data: { status: 'INACTIVE' }
+      })
+    ]);
+
+    res.status(200).json({ success: true, message: 'Worker deleted successfully' });
   } catch (error) {
     next(error);
   }
@@ -139,3 +305,158 @@ export const getNotifications = async (req: Request, res: Response, next: NextFu
   }
 };
 
+export const getProfile = async (req: any, res: Response, next: NextFunction) => {
+  try {
+    const userId = req.user?.userId;
+    const user = await prisma.user.findUnique({
+      where: { id: userId },
+      include: { adminProfile: true }
+    });
+
+    if (!user || !user.adminProfile) {
+      return res.status(404).json({ success: false, message: 'Admin profile not found' });
+    }
+
+    res.status(200).json({
+      success: true,
+      data: {
+        name: user.adminProfile.fullName,
+        email: user.email ?? '',
+        phone: user.mobile ?? '',
+        role: user.role,
+        location: user.adminProfile.location ?? '',
+        joinedAt: (user as any).createdAt ?? new Date().toISOString(),
+        initials: user.adminProfile.fullName
+          .split(' ')
+          .map((n: string) => n[0])
+          .join('')
+          .toUpperCase()
+          .slice(0, 2),
+      }
+    });
+  } catch (error) {
+    next(error);
+  }
+};
+
+export const createCustomer = async (req: Request, res: Response, next: NextFunction) => {
+  try {
+    const { fullName, email, mobile, password, vehicle, groupId, address } = req.body;
+    if (!fullName) return res.status(400).json({ success: false, message: 'Full name is required' });
+
+    if (email || mobile) {
+      const existing = await prisma.user.findFirst({
+        where: { OR: [...(email ? [{ email }] : []), ...(mobile ? [{ mobile }] : [])] }
+      });
+      if (existing) return res.status(409).json({ success: false, message: 'User already exists' });
+    }
+
+    const hashedPassword = password ? await bcrypt.hash(password, 10) : undefined;
+    
+    const customer = await prisma.user.create({
+      data: {
+        email, mobile, password: hashedPassword, role: 'CUSTOMER',
+        customerProfile: { create: { fullName, vehicle, groupId, address } }
+      },
+      include: { customerProfile: { include: { group: true } } }
+    });
+    res.status(201).json({ success: true, data: customer.customerProfile });
+  } catch (error) { next(error); }
+};
+
+export const updateCustomer = async (req: Request, res: Response, next: NextFunction) => {
+  try {
+    const id = req.params.id as string;
+    const { fullName, email, mobile, password, vehicle, groupId, address, status } = req.body;
+
+    const profile = await prisma.customerProfile.findUnique({ where: { id } });
+    if (!profile) return res.status(404).json({ success: false, message: 'Customer not found' });
+
+    const hashedPassword = password ? await bcrypt.hash(password, 10) : undefined;
+    const updated = await prisma.customerProfile.update({
+      where: { id },
+      data: {
+        fullName, vehicle, groupId, address,
+        user: { update: { email, mobile, ...(hashedPassword && { password: hashedPassword }), ...(status && { status: status as any }) } }
+      },
+      include: { user: true, group: true }
+    });
+    res.status(200).json({ success: true, data: updated });
+  } catch (error) { next(error); }
+};
+
+export const deleteCustomer = async (req: Request, res: Response, next: NextFunction) => {
+  try {
+    const id = req.params.id as string;
+    const profile = await prisma.customerProfile.findUnique({ where: { id } });
+    if (!profile) return res.status(404).json({ success: false, message: 'Customer not found' });
+    await prisma.$transaction([
+      prisma.customerProfile.delete({ where: { id } }),
+      prisma.user.delete({ where: { id: profile.userId } })
+    ]);
+    res.status(200).json({ success: true, message: 'Customer deleted' });
+  } catch (error) { next(error); }
+};
+
+export const createGroup = async (req: Request, res: Response, next: NextFunction) => {
+  try {
+    const { name, discountPercent, description, isDefault } = req.body;
+    const group = await prisma.group.create({ data: { name, discountPercent, description, isDefault } });
+    res.status(201).json({ success: true, data: group });
+  } catch (error) { next(error); }
+};
+
+export const updateGroup = async (req: Request, res: Response, next: NextFunction) => {
+  try {
+    const id = req.params.id as string;
+    const { name, discountPercent, description, isDefault, active } = req.body;
+    const group = await prisma.group.update({
+      where: { id }, data: { name, discountPercent, description, isDefault, active }
+    });
+    res.status(200).json({ success: true, data: group });
+  } catch (error) { next(error); }
+};
+
+export const toggleGroupActive = async (req: Request, res: Response, next: NextFunction) => {
+  try {
+    const id = req.params.id as string;
+    const group = await prisma.group.findUnique({ where: { id } });
+    if (!group) return res.status(404).json({ success: false, message: 'Group not found' });
+    const updated = await prisma.group.update({ where: { id }, data: { active: !group.active } });
+    res.status(200).json({ success: true, data: updated });
+  } catch (error) { next(error); }
+};
+
+export const deleteGroup = async (req: Request, res: Response, next: NextFunction) => {
+  try {
+    const id = req.params.id as string;
+    await prisma.group.delete({ where: { id } });
+    res.status(200).json({ success: true, message: 'Group deleted' });
+  } catch (error) { next(error); }
+};
+
+export const markNotificationRead = async (req: any, res: Response, next: NextFunction) => {
+  try {
+    const id = req.params.id as string;
+    const userId = req.user?.userId;
+    // ensure notification belongs to user or is global
+    const notif = await prisma.notification.findUnique({ where: { id } });
+    if (!notif) return res.status(404).json({ success: false, message: 'Notification not found' });
+    if (notif.userId && notif.userId !== userId) return res.status(403).json({ success: false, message: 'Unauthorized' });
+
+    const updated = await prisma.notification.update({ where: { id }, data: { read: true } });
+    res.status(200).json({ success: true, data: updated });
+  } catch (error) { next(error); }
+};
+
+export const markAllNotificationsRead = async (req: any, res: Response, next: NextFunction) => {
+  try {
+    const userId = req.user?.userId;
+    // update all for this user, OR global if allowed, but safest is to scope to user
+    await prisma.notification.updateMany({ 
+      where: { OR: [{ userId }, { userId: null }] }, 
+      data: { read: true } 
+    });
+    res.status(200).json({ success: true, message: 'All notifications marked as read' });
+  } catch (error) { next(error); }
+};

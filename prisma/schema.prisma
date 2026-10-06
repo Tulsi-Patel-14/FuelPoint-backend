@@ -19,6 +19,7 @@ enum AccountStatus {
   ACTIVE
   SUSPENDED
   INACTIVE
+  OFFLINE
 }
 
 enum FuelType {
@@ -90,6 +91,7 @@ model WorkerProfile {
   station   Station? @relation(fields: [stationId], references: [id])
   joinedAt  DateTime @default(now())
   scans     Int      @default(0)
+  isDeleted Boolean  @default(false)
 
   transactions Transaction[]
 }

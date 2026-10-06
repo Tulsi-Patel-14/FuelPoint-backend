@@ -15,7 +15,7 @@ export const authMiddleware = (
   next: NextFunction
 ) => {
   try {
-    const authHeader = req.headers.authorization;
+    console.log('Method:', req.method, 'Headers:', req.headers); const authHeader = req.headers.authorization;
     if (!authHeader || !authHeader.startsWith('Bearer ')) {
       throw new AppError(401, 'Unauthorized');
     }
