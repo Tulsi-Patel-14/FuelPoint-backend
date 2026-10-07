@@ -17,6 +17,18 @@ app.use(express.json());
 app.use(express.urlencoded({ extended: true }));
 app.use(morgan('dev'));
 
+// Custom middleware to log incoming API calls and their data
+app.use((req, res, next) => {
+  console.log(`\n[API CALL] ${req.method} ${req.originalUrl}`);
+  if (req.body && Object.keys(req.body).length > 0) {
+    console.log('-> Body Data:', JSON.stringify(req.body, null, 2));
+  }
+  if (req.query && Object.keys(req.query).length > 0) {
+    console.log('-> Query Data:', JSON.stringify(req.query, null, 2));
+  }
+  next();
+});
+
 app.get('/health', (req, res) => {
   res.status(200).json({ success: true, message: 'Backend is healthy' });
 });
