@@ -1,0 +1,1 @@
+import { generateTokens } from './src/utils/jwt'; async function run() { const token = generateTokens('45c5a6b1-4203-4ccb-b948-b105c337523b', 'CUSTOMER').accessToken; const res = await fetch('http://localhost:5000/api/v1/customer-app/transactions/today', { headers: { 'Authorization': 'Bearer ' + token } }); console.log(await res.json()); } run();

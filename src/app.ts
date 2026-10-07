@@ -35,7 +35,8 @@ app.get('/health', (req, res) => {
 
 import router from './routes/index';
 
-app.use('/api/v1', router);
+const apiPrefix = process.env.API_PREFIX || '/api/v1';
+app.use(apiPrefix, router);
 
 app.use(notFoundHandler);
 app.use(errorHandler);

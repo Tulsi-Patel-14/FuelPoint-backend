@@ -148,10 +148,19 @@ export const getQRStatus = async (req: Request, res: Response, next: NextFunctio
       return res.status(404).json({ success: false, message: 'QR not found' });
     }
 
+    let status = qrSession.status;
+    if (status === 'ACTIVE' && new Date() > qrSession.expiresAt) {
+      status = 'EXPIRED';
+      await prisma.qRSession.update({
+        where: { id: qrSession.id },
+        data: { status: 'EXPIRED' }
+      });
+    }
+
     res.status(200).json({
       success: true,
       data: {
-        status: qrSession.status,
+        status,
         expiresAt: qrSession.expiresAt.getTime()
       }
     });
