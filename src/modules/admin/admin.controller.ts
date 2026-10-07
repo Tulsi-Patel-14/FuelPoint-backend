@@ -39,22 +39,225 @@ export const login = async (req: Request, res: Response, next: NextFunction) => 
 
 export const getDashboard = async (req: Request, res: Response, next: NextFunction) => {
   try {
-    const totalCustomers = await prisma.customerProfile.count();
-    const totalWorkers = await prisma.workerProfile.count();
-    
-    const transactions = await prisma.transaction.aggregate({
-      _count: { id: true },
-      _sum: { amount: true, discountAmount: true }
+    const days = Math.min(365, Math.max(1, parseInt(req.query.days as string) || 30));
+    const now = new Date();
+    const cutoff = new Date(now.getTime() - days * 24 * 60 * 60 * 1000);
+    const startOfToday = new Date(now.getFullYear(), now.getMonth(), now.getDate());
+
+    // 1. Core database queries
+    const [
+      totalCustomers,
+      totalWorkers,
+      activeWorkers,
+      groups,
+      allPeriodTransactions,
+      todayTransactionsAgg,
+      recentTxnsRaw,
+      periodCustomers
+    ] = await Promise.all([
+      // Total non-deleted customers
+      prisma.customerProfile.count({ where: { isDeleted: false } }),
+      // Total non-deleted workers
+      prisma.workerProfile.count({ where: { isDeleted: false } }),
+      // Active workers
+      prisma.workerProfile.count({
+        where: { isDeleted: false, user: { status: 'ACTIVE' } }
+      }),
+      // Active groups with their non-deleted customers count and transactions
+      prisma.group.findMany({
+        where: { isDeleted: false },
+        include: {
+          customers: {
+            where: { isDeleted: false },
+            select: { id: true }
+          }
+        }
+      }),
+      // Completed transactions in this period
+      prisma.transaction.findMany({
+        where: {
+          status: 'COMPLETED',
+          createdAt: { gte: cutoff }
+        },
+        select: {
+          id: true,
+          amount: true,
+          discountAmount: true,
+          discountPercent: true,
+          customerId: true,
+          workerId: true,
+          createdAt: true,
+          customer: { select: { groupId: true } }
+        }
+      }),
+      // Today's completed transactions aggregate
+      prisma.transaction.aggregate({
+        where: {
+          status: 'COMPLETED',
+          createdAt: { gte: startOfToday }
+        },
+        _count: { id: true },
+        _sum: { discountAmount: true }
+      }),
+      // Latest 8 transactions with joined customer and worker
+      prisma.transaction.findMany({
+        where: { status: 'COMPLETED' },
+        include: {
+          customer: { select: { id: true, fullName: true, groupId: true } },
+          worker: { select: { id: true, fullName: true } }
+        },
+        orderBy: { createdAt: 'desc' },
+        take: 8
+      }),
+      // Customers registered in this period for timeline and growth
+      prisma.customerProfile.findMany({
+        where: {
+          isDeleted: false,
+          joinedAt: { gte: cutoff }
+        },
+        select: { id: true, joinedAt: true }
+      })
+    ]);
+
+    // 2. Calculations for overview
+    const totalTransactions = allPeriodTransactions.length;
+    const totalDiscount = allPeriodTransactions.reduce((s, t) => s + (t.discountAmount || 0), 0);
+    const totalRevenue = allPeriodTransactions.reduce((s, t) => s + (t.amount || 0), 0);
+    const todayTransactions = todayTransactionsAgg._count.id || 0;
+    const todayDiscount = todayTransactionsAgg._sum.discountAmount || 0;
+    const avgDiscountPercent = totalRevenue > 0 ? (totalDiscount / totalRevenue) * 100 : 0;
+
+    // 3. Build Daily Time Series (buckets) for charts
+    const buckets = new Map<string, {
+      date: string;
+      label: string;
+      transactions: number;
+      discount: number;
+      registrations: number;
+      revenue: number;
+    }>();
+
+    for (let i = days - 1; i >= 0; i--) {
+      const d = new Date(now.getTime() - i * 24 * 60 * 60 * 1000);
+      const key = d.toISOString().slice(0, 10);
+      buckets.set(key, {
+        date: key,
+        label: d.toLocaleDateString('en-IN', { day: '2-digit', month: 'short' }),
+        transactions: 0,
+        discount: 0,
+        registrations: 0,
+        revenue: 0,
+      });
+    }
+
+    allPeriodTransactions.forEach((t) => {
+      const key = new Date(t.createdAt).toISOString().slice(0, 10);
+      const b = buckets.get(key);
+      if (b) {
+        b.transactions += 1;
+        b.discount += (t.discountAmount || 0);
+        b.revenue += (t.amount || 0);
+      }
     });
+
+    periodCustomers.forEach((c) => {
+      const key = new Date(c.joinedAt).toISOString().slice(0, 10);
+      const b = buckets.get(key);
+      if (b) {
+        b.registrations += 1;
+      }
+    });
+
+    const series = Array.from(buckets.values());
+
+    // Calculate growth deltas (% change between first half of period and second half)
+    const half = Math.floor(series.length / 2);
+    const calcDelta = (key: 'transactions' | 'discount' | 'registrations') => {
+      const firstHalf = series.slice(0, half).reduce((s, p) => s + p[key], 0);
+      const secondHalf = series.slice(half).reduce((s, p) => s + p[key], 0);
+      if (!firstHalf) return 0;
+      return Number((((secondHalf - firstHalf) / firstHalf) * 100).toFixed(1));
+    };
+
+    const deltaRegistrations = calcDelta('registrations');
+    const deltaDiscount = calcDelta('discount');
+
+    // 4. Group distribution
+    const groupDistribution = groups.map((g) => {
+      const groupTxns = allPeriodTransactions.filter((t) => t.customer?.groupId === g.id);
+      return {
+        id: g.id,
+        name: g.name,
+        discountPercent: g.discountPercent,
+        active: g.active,
+        customers: g.customers.length,
+        transactions: groupTxns.length,
+        discountGenerated: groupTxns.reduce((s, t) => s + (t.discountAmount || 0), 0)
+      };
+    });
+
+    // 5. Worker activity (top workers by scans/transactions)
+    const allWorkers = await prisma.workerProfile.findMany({
+      where: { isDeleted: false },
+      select: {
+        id: true,
+        fullName: true,
+        scans: true,
+        transactions: {
+          where: { status: 'COMPLETED', createdAt: { gte: cutoff } },
+          select: { id: true, discountAmount: true }
+        }
+      }
+    });
+
+    const workerActivity = allWorkers
+      .map((w) => ({
+        id: w.id,
+        name: w.fullName ? w.fullName.split(' ')[0] : 'Worker',
+        scans: w.scans,
+        transactions: w.transactions.length,
+        discountProcessed: w.transactions.reduce((s, t) => s + (t.discountAmount || 0), 0)
+      }))
+      .sort((a, b) => b.scans - a.scans)
+      .slice(0, 8);
+
+    // 6. Map recent transactions with clean fields
+    const recentTransactions = recentTxnsRaw.map((t) => ({
+      id: t.id,
+      customerId: t.customerId,
+      customerName: t.customer?.fullName || 'Customer',
+      workerId: t.workerId,
+      workerName: t.worker?.fullName || 'Worker',
+      groupId: t.customer?.groupId || 'default',
+      amount: t.amount,
+      discountPercent: t.discountPercent,
+      discountAmount: t.discountAmount,
+      litres: t.litres,
+      fuel: t.fuelType,
+      createdAt: t.createdAt
+    }));
 
     res.status(200).json({
       success: true,
       data: {
-        totalCustomers,
-        totalWorkers,
-        totalTransactions: transactions._count.id,
-        totalRevenue: transactions._sum.amount || 0,
-        totalDiscount: transactions._sum.discountAmount || 0,
+        days,
+        overview: {
+          totalCustomers,
+          totalWorkers,
+          activeWorkers,
+          totalDiscount,
+          totalRevenue,
+          totalTransactions,
+          todayTransactions,
+          todayDiscount,
+          avgDiscountPercent,
+          deltaRegistrations,
+          deltaDiscount
+        },
+        series,
+        groupDistribution,
+        workerActivity,
+        recentTransactions
       }
     });
   } catch (error) {
