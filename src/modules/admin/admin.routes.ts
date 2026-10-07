@@ -1,11 +1,11 @@
 import { Router } from 'express';
 import { 
-  login, forgotPassword, resetPassword, getDashboard, getProfile,
+  login, forgotPassword, resetPassword, getDashboard, getProfile, updateProfile, changePassword,
   getCustomers, createCustomer, updateCustomer, deleteCustomer,
   getWorkers, createWorker, getWorkerById, updateWorker, deleteWorker,
   getTransactions, 
   getGroups, createGroup, updateGroup, toggleGroupActive, deleteGroup,
-  getNotifications, markNotificationRead, markAllNotificationsRead
+  getNotifications, markNotificationRead, markAllNotificationsRead, uploadProfileImage, globalSearch
 } from './admin.controller';
 import {
   getStations, getStationById, createStation, updateStation, deleteStation,
@@ -29,8 +29,29 @@ router.post('/auth/reset-password', resetPassword);
 router.use(authMiddleware);
 router.use(roleMiddleware([Role.ADMIN, Role.SUPER_ADMIN]));
 
+import multer from 'multer';
+import path from 'path';
+
+const storage = multer.diskStorage({
+  destination: function (req, file, cb) {
+    cb(null, path.join(process.cwd(), 'public/uploads'))
+  },
+  filename: function (req, file, cb) {
+    const uniqueSuffix = Date.now() + '-' + Math.round(Math.random() * 1E9)
+    cb(null, file.fieldname + '-' + uniqueSuffix + path.extname(file.originalname))
+  }
+});
+const upload = multer({ storage: storage });
+
 router.get('/dashboard', getDashboard);
 router.get('/profile', getProfile);
+router.put('/profile', updateProfile);
+router.patch('/profile', updateProfile);
+router.patch('/profile/password', changePassword);
+router.put('/profile/password', changePassword);
+router.post('/profile/upload', upload.single('profileImage'), uploadProfileImage);
+
+router.get('/search', globalSearch);
 
 // Customers
 router.get('/customers', getCustomers);

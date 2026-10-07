@@ -103,8 +103,9 @@ model AdminProfile {
   id        String   @id @default(uuid())
   userId    String   @unique
   user      User     @relation(fields: [userId], references: [id])
-  fullName  String
-  location  String?
+  fullName     String
+  location     String?
+  profilePhoto String?
 }
 
 model Station {

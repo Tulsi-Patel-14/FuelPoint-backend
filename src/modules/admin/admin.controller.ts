@@ -1009,6 +1009,7 @@ export const getProfile = async (req: any, res: Response, next: NextFunction) =>
         role: user.role,
         location: user.adminProfile.location ?? '',
         joinedAt: (user as any).createdAt ?? new Date().toISOString(),
+        profileImage: user.adminProfile.profilePhoto ?? null,
         initials: user.adminProfile.fullName
           .split(' ')
           .map((n: string) => n[0])
@@ -1017,6 +1018,204 @@ export const getProfile = async (req: any, res: Response, next: NextFunction) =>
           .slice(0, 2),
       }
     });
+  } catch (error) {
+    next(error);
+  }
+};
+
+export const updateProfile = async (req: any, res: Response, next: NextFunction) => {
+  try {
+    const userId = req.user?.userId;
+    const { name, email, phone, location, profileImage } = req.body;
+
+    const user = await prisma.user.findUnique({
+      where: { id: userId },
+      include: { adminProfile: true }
+    });
+
+    if (!user || !user.adminProfile) {
+      return res.status(404).json({ success: false, message: 'Admin profile not found' });
+    }
+
+    const cleanEmail = email && typeof email === 'string' && email.trim() ? email.trim() : (email === null ? null : undefined);
+    const cleanMobile = phone && typeof phone === 'string' && phone.trim() ? phone.trim() : (phone === null ? null : undefined);
+
+    if (cleanEmail || cleanMobile) {
+      const existing = await prisma.user.findFirst({
+        where: {
+          id: { not: userId },
+          OR: [
+            ...(cleanEmail ? [{ email: cleanEmail }] : []),
+            ...(cleanMobile ? [{ mobile: cleanMobile }] : [])
+          ]
+        }
+      });
+      if (existing) {
+        if (cleanEmail && existing.email === cleanEmail) return res.status(409).json({ success: false, message: 'Email is already in use.' });
+        if (cleanMobile && existing.mobile === cleanMobile) return res.status(409).json({ success: false, message: 'Phone number is already in use.' });
+      }
+    }
+
+    await prisma.user.update({
+      where: { id: userId },
+      data: {
+        email: cleanEmail !== undefined ? cleanEmail : undefined,
+        mobile: cleanMobile !== undefined ? cleanMobile : undefined,
+        adminProfile: {
+          update: {
+            fullName: name !== undefined ? name : undefined,
+            location: location !== undefined ? location : undefined,
+            profilePhoto: profileImage !== undefined ? profileImage : undefined
+          }
+        }
+      }
+    });
+
+    const updatedUser = await prisma.user.findUnique({
+      where: { id: userId },
+      include: { adminProfile: true }
+    });
+
+    res.status(200).json({
+      success: true,
+      message: 'Profile updated successfully',
+      data: {
+        name: updatedUser!.adminProfile!.fullName,
+        email: updatedUser!.email ?? '',
+        phone: updatedUser!.mobile ?? '',
+        role: updatedUser!.role,
+        location: updatedUser!.adminProfile!.location ?? '',
+        joinedAt: (updatedUser as any).createdAt ?? new Date().toISOString(),
+        profileImage: updatedUser!.adminProfile!.profilePhoto ?? null,
+        initials: updatedUser!.adminProfile!.fullName
+          .split(' ')
+          .map((n: string) => n[0])
+          .join('')
+          .toUpperCase()
+          .slice(0, 2),
+      }
+    });
+  } catch (error) {
+    next(error);
+  }
+};
+
+export const changePassword = async (req: any, res: Response, next: NextFunction) => {
+  try {
+    const userId = req.user?.userId;
+    const { currentPassword, newPassword, confirmPassword } = req.body;
+
+    if (!currentPassword || !newPassword || !confirmPassword) {
+      return res.status(400).json({ success: false, message: 'All password fields are required' });
+    }
+
+    if (newPassword !== confirmPassword) {
+      return res.status(400).json({ success: false, message: 'New password and confirm password do not match' });
+    }
+
+    if (newPassword.length < 6) {
+      return res.status(400).json({ success: false, message: 'New password must be at least 6 characters long' });
+    }
+
+    const user = await prisma.user.findUnique({
+      where: { id: userId }
+    });
+
+    if (!user || !user.password) {
+      return res.status(404).json({ success: false, message: 'Admin not found' });
+    }
+
+    const isMatch = await bcrypt.compare(currentPassword, user.password);
+    if (!isMatch) {
+      return res.status(401).json({ success: false, message: 'Invalid current password' });
+    }
+
+    const hashedPassword = await bcrypt.hash(newPassword, 10);
+
+    await prisma.user.update({
+      where: { id: userId },
+      data: { password: hashedPassword }
+    });
+
+    res.status(200).json({
+      success: true,
+      message: 'Password changed successfully'
+    });
+  } catch (error) {
+    next(error);
+  }
+};
+
+export const uploadProfileImage = async (req: any, res: Response, next: NextFunction) => {
+  try {
+    const userId = req.user?.userId;
+    if (!req.file) {
+      return res.status(400).json({ success: false, message: 'No file uploaded' });
+    }
+
+    // construct URL for the uploaded file
+    const fileUrl = `${req.protocol}://${req.get('host')}/uploads/${req.file.filename}`;
+
+    await prisma.user.update({
+      where: { id: userId },
+      data: {
+        adminProfile: {
+          update: {
+            profilePhoto: fileUrl
+          }
+        }
+      }
+    });
+
+    res.status(200).json({
+      success: true,
+      message: 'Profile image uploaded successfully',
+      data: {
+        profileImage: fileUrl
+      }
+    });
+  } catch (error) {
+    next(error);
+  }
+};
+
+export const globalSearch = async (req: Request, res: Response, next: NextFunction) => {
+  try {
+    const q = req.query.q as string;
+    if (!q || q.length < 2) {
+      return res.status(200).json({ success: true, data: [] });
+    }
+
+    const searchTerm = q.trim();
+
+    // Customers
+    const customers = await prisma.customerProfile.findMany({
+      where: { fullName: { contains: searchTerm, mode: 'insensitive' }, isDeleted: false },
+      select: { id: true, fullName: true },
+      take: 5
+    });
+
+    // Workers
+    const workers = await prisma.workerProfile.findMany({
+      where: { fullName: { contains: searchTerm, mode: 'insensitive' }, isDeleted: false },
+      select: { id: true, fullName: true },
+      take: 5
+    });
+
+    // Groups
+    const groups = await prisma.group.findMany({
+      where: { name: { contains: searchTerm, mode: 'insensitive' }, isDeleted: false },
+      select: { id: true, name: true },
+      take: 5
+    });
+
+    const results = [
+      ...customers.map(c => ({ type: 'customer', id: c.id, name: c.fullName })),
+      ...workers.map(w => ({ type: 'worker', id: w.id, name: w.fullName })),
+      ...groups.map(g => ({ type: 'group', id: g.id, name: g.name }))
+    ];
+
+    res.status(200).json({ success: true, data: results });
   } catch (error) {
     next(error);
   }

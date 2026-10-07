@@ -8,6 +8,15 @@ const swaggerDocument = {
     version: '1.0.0',
     description: 'API documentation for Customer, Worker, and Admin clients.'
   },
+  components: {
+    securitySchemes: {
+      bearerAuth: {
+        type: 'http',
+        scheme: 'bearer',
+        bearerFormat: 'JWT'
+      }
+    }
+  },
   paths: {
     '/api/v1/admin/auth/forgot-password': {
       post: {
@@ -48,12 +57,8 @@ const swaggerDocument = {
               }
             }
           },
-          400: {
-            description: 'Invalid input'
-          },
-          429: {
-            description: 'Too many reset requests'
-          }
+          400: { description: 'Invalid input' },
+          429: { description: 'Too many reset requests' }
         }
       }
     },
@@ -104,9 +109,72 @@ const swaggerDocument = {
               }
             }
           },
-          400: {
-            description: 'Invalid or expired token, or invalid password'
+          400: { description: 'Invalid or expired token, or invalid password' }
+        }
+      }
+    },
+    '/api/v1/admin/profile': {
+      get: {
+        summary: 'Get Admin Profile',
+        tags: ['Admin Profile'],
+        security: [{ bearerAuth: [] }],
+        responses: {
+          '200': { description: 'Successful response' },
+          '404': { description: 'Admin profile not found' }
+        }
+      },
+      put: {
+        summary: 'Update Admin Profile',
+        tags: ['Admin Profile'],
+        security: [{ bearerAuth: [] }],
+        requestBody: {
+          content: {
+            'application/json': {
+              schema: {
+                type: 'object',
+                properties: {
+                  name: { type: 'string' },
+                  email: { type: 'string' },
+                  phone: { type: 'string' },
+                  location: { type: 'string' },
+                  profileImage: { type: 'string' }
+                }
+              }
+            }
           }
+        },
+        responses: {
+          '200': { description: 'Profile updated successfully' },
+          '400': { description: 'Bad request' },
+          '409': { description: 'Conflict (Email or Phone already exists)' }
+        }
+      }
+    },
+    '/api/v1/admin/profile/password': {
+      patch: {
+        summary: 'Change Admin Password',
+        tags: ['Admin Profile'],
+        security: [{ bearerAuth: [] }],
+        requestBody: {
+          required: true,
+          content: {
+            'application/json': {
+              schema: {
+                type: 'object',
+                required: ['currentPassword', 'newPassword', 'confirmPassword'],
+                properties: {
+                  currentPassword: { type: 'string' },
+                  newPassword: { type: 'string' },
+                  confirmPassword: { type: 'string' }
+                }
+              }
+            }
+          }
+        },
+        responses: {
+          '200': { description: 'Password changed successfully' },
+          '400': { description: 'Invalid input' },
+          '401': { description: 'Invalid current password' }
         }
       }
     }
