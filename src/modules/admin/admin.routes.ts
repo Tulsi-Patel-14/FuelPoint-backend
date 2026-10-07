@@ -1,6 +1,6 @@
 import { Router } from 'express';
 import { 
-  login, forgotPassword, resetPassword, getDashboard, getProfile, updateProfile, changePassword,
+  login, forgotPassword, resetPassword, verifyResetToken, getDashboard, getProfile, updateProfile, changePassword,
   getCustomers, createCustomer, updateCustomer, deleteCustomer,
   getWorkers, createWorker, getWorkerById, updateWorker, deleteWorker,
   getTransactions, 
@@ -25,6 +25,8 @@ const router = Router();
 router.post('/auth/login', login);
 router.post('/auth/forgot-password', forgotPassword);
 router.post('/auth/reset-password', resetPassword);
+router.get('/auth/verify-reset-token', verifyResetToken);
+router.post('/auth/verify-reset-token', verifyResetToken);
 
 router.use(authMiddleware);
 router.use(roleMiddleware([Role.ADMIN, Role.SUPER_ADMIN]));

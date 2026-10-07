@@ -177,6 +177,43 @@ const swaggerDocument = {
           '401': { description: 'Invalid current password' }
         }
       }
+    },
+    '/api/v1/admin/auth/verify-reset-token': {
+      get: {
+        summary: 'Verify whether a password reset token is valid and unused',
+        tags: ['Admin Auth'],
+        parameters: [
+          {
+            name: 'token',
+            in: 'query',
+            required: true,
+            schema: {
+              type: 'string',
+              example: 'e83a7f9...'
+            }
+          }
+        ],
+        responses: {
+          200: {
+            description: 'Token is valid and active',
+            content: {
+              'application/json': {
+                schema: {
+                  type: 'object',
+                  properties: {
+                    success: { type: 'boolean', example: true },
+                    valid: { type: 'boolean', example: true },
+                    message: { type: 'string', example: 'Password reset link is valid.' }
+                  }
+                }
+              }
+            }
+          },
+          400: {
+            description: 'Token is invalid, expired, or already used'
+          }
+        }
+      }
     }
   }
 };

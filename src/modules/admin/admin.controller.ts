@@ -225,6 +225,53 @@ export const resetPassword = async (req: Request, res: Response, next: NextFunct
   }
 };
 
+export const verifyResetToken = async (req: Request, res: Response, next: NextFunction) => {
+  try {
+    const rawToken = (req.query.token as string) || req.body?.token;
+
+    if (!rawToken || typeof rawToken !== 'string' || !rawToken.trim()) {
+      return res.status(400).json({
+        success: false,
+        valid: false,
+        message: 'This password reset link is invalid or has expired.'
+      });
+    }
+
+    const tokenHash = crypto.createHash('sha256').update(rawToken.trim()).digest('hex');
+
+    const tokenRecord = await prisma.passwordResetToken.findUnique({
+      where: { tokenHash },
+      include: { user: true }
+    });
+
+    const now = new Date();
+    if (!tokenRecord || tokenRecord.usedAt !== null || tokenRecord.expiresAt < now) {
+      return res.status(400).json({
+        success: false,
+        valid: false,
+        message: 'This password reset link is invalid or has expired.'
+      });
+    }
+
+    const user = tokenRecord.user;
+    if (!user || (user.role !== 'ADMIN' && user.role !== 'SUPER_ADMIN')) {
+      return res.status(400).json({
+        success: false,
+        valid: false,
+        message: 'This password reset link is invalid or has expired.'
+      });
+    }
+
+    return res.status(200).json({
+      success: true,
+      valid: true,
+      message: 'Password reset link is valid.'
+    });
+  } catch (error) {
+    next(error);
+  }
+};
+
 export const getDashboard = async (req: Request, res: Response, next: NextFunction) => {
   try {
     const days = Math.min(365, Math.max(1, parseInt(req.query.days as string) || 30));
