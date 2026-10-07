@@ -9,9 +9,13 @@ import {
 } from './admin.controller';
 import {
   getStations, getStationById, createStation, updateStation, deleteStation,
-  generateQR, validateQR, scanQR,
-  getReportSummary
+  generateQR, validateQR, scanQR
 } from './extra.controller';
+import {
+  getReportSummary,
+  getReportData,
+  exportReport
+} from './report.controller';
 import { authMiddleware } from '../../middlewares/auth.middleware';
 import { roleMiddleware } from '../../middlewares/role.middleware';
 import { Role } from '@prisma/client';
@@ -68,5 +72,7 @@ router.post('/qr/scan', scanQR);
 
 // Reports
 router.get('/reports/summary', getReportSummary);
+router.get('/reports/data', getReportData);
+router.get('/reports/export', exportReport);
 
 export default router;

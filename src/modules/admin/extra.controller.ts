@@ -10,5 +10,4 @@ export const generateQR = async (req: Request, res: Response, next: NextFunction
 export const validateQR = async (req: Request, res: Response, next: NextFunction) => { res.status(501).json({ message: 'Not Implemented' }); };
 export const scanQR = async (req: Request, res: Response, next: NextFunction) => { res.status(501).json({ message: 'Not Implemented' }); };
 
-export const getReportSummary = async (req: Request, res: Response, next: NextFunction) => { res.status(501).json({ message: 'Not Implemented' }); };
 
