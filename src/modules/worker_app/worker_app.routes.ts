@@ -1,10 +1,10 @@
 import { Router } from 'express';
-import { 
-  requestOtp, 
-  verifyOtpAndLogin, 
-  scanCustomerQR, 
+import {
+  requestOtp,
+  verifyOtpAndLogin,
+  scanCustomerQR,
   verifyCustomerOtp,
-  submitTransaction, 
+  submitTransaction,
   getTodayTransactions,
   getWorkerProfile,
   getMonthlySummary,

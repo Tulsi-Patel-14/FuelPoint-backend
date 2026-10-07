@@ -41,7 +41,7 @@ export const requestOtp = async (req: Request, res: Response, next: NextFunction
       success: true, 
       message: 'OTP sent successfully to registered mobile number.',
       // We can also return it in response for easy testing on frontend
-      mockOtpForTesting: otp 
+      otp: otp 
     });
   } catch (error) {
     next(error);
@@ -261,6 +261,10 @@ export const verifyCustomerOtp = async (req: Request, res: Response, next: NextF
             finalAmount,
             litres,
             idempotencyKey
+          },
+          include: {
+            customer: { select: { fullName: true, vehicle: true, group: true } },
+            station: { select: { name: true, latitude: true, longitude: true } }
           }
         });
   
@@ -270,7 +274,13 @@ export const verifyCustomerOtp = async (req: Request, res: Response, next: NextF
           data: { status: 'COMPLETED', consumedAt: new Date() }
         });
   
-        return newTx;
+        // Return transaction mapped with the necessary UI fields
+        return {
+          ...newTx,
+          customerName: newTx.customer?.fullName,
+          groupName: newTx.customer?.group?.name,
+          petrolPumpName: newTx.station?.name
+        };
       });
   
       res.status(200).json({
@@ -636,7 +646,14 @@ export const getTransactionById = async (req: Request, res: Response, next: Next
         workerId: worker.id
       },
       include: {
-        customer: { select: { fullName: true, vehicle: true, group: true } },
+        customer: {
+          select: {
+            fullName: true,
+            vehicle: true,
+            user: { select: { mobile: true } },
+            group: true
+          }
+        },
         station: { select: { name: true, latitude: true, longitude: true } }
       }
     });
@@ -645,9 +662,17 @@ export const getTransactionById = async (req: Request, res: Response, next: Next
       return res.status(404).json({ success: false, message: 'Transaction not found.' });
     }
 
+    const group = transaction.customer?.group;
     const formattedTransaction = {
       ...transaction,
-      customerName: transaction.customer?.fullName || 'Unknown Customer'
+      transactionId: transaction.id,
+      customerName: transaction.customer?.fullName || 'Unknown Customer',
+      customerMobile: transaction.customer?.user?.mobile || 'N/A',
+      groupName: group?.name || 'Standard',
+      groupType: group?.name || 'Standard',
+      discountPercentage: transaction.discountPercent,
+      fuelAmount: transaction.amount,
+      stationName: transaction.station?.name || 'Station'
     };
 
     res.status(200).json({
