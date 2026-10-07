@@ -15,13 +15,12 @@ export const authMiddleware = (
   next: NextFunction
 ) => {
   try {
-    console.log('Method:', req.method, 'Headers:', req.headers); const authHeader = req.headers.authorization;
+    const authHeader = req.headers.authorization;
     if (!authHeader || !authHeader.startsWith('Bearer ')) {
       throw new AppError(401, 'Unauthorized');
     }
 
     const token = authHeader.split(' ')[1];
-    console.log('Token received:', token);
     const secret = process.env.JWT_ACCESS_SECRET || 'super-secret-access-key-for-petrol-pump';
     const decoded = jwt.verify(token, secret) as any;
 
