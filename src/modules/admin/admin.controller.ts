@@ -39,22 +39,225 @@ export const login = async (req: Request, res: Response, next: NextFunction) => 
 
 export const getDashboard = async (req: Request, res: Response, next: NextFunction) => {
   try {
-    const totalCustomers = await prisma.customerProfile.count();
-    const totalWorkers = await prisma.workerProfile.count();
-    
-    const transactions = await prisma.transaction.aggregate({
-      _count: { id: true },
-      _sum: { amount: true, discountAmount: true }
+    const days = Math.min(365, Math.max(1, parseInt(req.query.days as string) || 30));
+    const now = new Date();
+    const cutoff = new Date(now.getTime() - days * 24 * 60 * 60 * 1000);
+    const startOfToday = new Date(now.getFullYear(), now.getMonth(), now.getDate());
+
+    // 1. Core database queries
+    const [
+      totalCustomers,
+      totalWorkers,
+      activeWorkers,
+      groups,
+      allPeriodTransactions,
+      todayTransactionsAgg,
+      recentTxnsRaw,
+      periodCustomers
+    ] = await Promise.all([
+      // Total non-deleted customers
+      prisma.customerProfile.count({ where: { isDeleted: false } }),
+      // Total non-deleted workers
+      prisma.workerProfile.count({ where: { isDeleted: false } }),
+      // Active workers
+      prisma.workerProfile.count({
+        where: { isDeleted: false, user: { status: 'ACTIVE' } }
+      }),
+      // Active groups with their non-deleted customers count and transactions
+      prisma.group.findMany({
+        where: { isDeleted: false },
+        include: {
+          customers: {
+            where: { isDeleted: false },
+            select: { id: true }
+          }
+        }
+      }),
+      // Completed transactions in this period
+      prisma.transaction.findMany({
+        where: {
+          status: 'COMPLETED',
+          createdAt: { gte: cutoff }
+        },
+        select: {
+          id: true,
+          amount: true,
+          discountAmount: true,
+          discountPercent: true,
+          customerId: true,
+          workerId: true,
+          createdAt: true,
+          customer: { select: { groupId: true } }
+        }
+      }),
+      // Today's completed transactions aggregate
+      prisma.transaction.aggregate({
+        where: {
+          status: 'COMPLETED',
+          createdAt: { gte: startOfToday }
+        },
+        _count: { id: true },
+        _sum: { discountAmount: true }
+      }),
+      // Latest 8 transactions with joined customer and worker
+      prisma.transaction.findMany({
+        where: { status: 'COMPLETED' },
+        include: {
+          customer: { select: { id: true, fullName: true, groupId: true } },
+          worker: { select: { id: true, fullName: true } }
+        },
+        orderBy: { createdAt: 'desc' },
+        take: 8
+      }),
+      // Customers registered in this period for timeline and growth
+      prisma.customerProfile.findMany({
+        where: {
+          isDeleted: false,
+          joinedAt: { gte: cutoff }
+        },
+        select: { id: true, joinedAt: true }
+      })
+    ]);
+
+    // 2. Calculations for overview
+    const totalTransactions = allPeriodTransactions.length;
+    const totalDiscount = allPeriodTransactions.reduce((s, t) => s + (t.discountAmount || 0), 0);
+    const totalRevenue = allPeriodTransactions.reduce((s, t) => s + (t.amount || 0), 0);
+    const todayTransactions = todayTransactionsAgg._count.id || 0;
+    const todayDiscount = todayTransactionsAgg._sum.discountAmount || 0;
+    const avgDiscountPercent = totalRevenue > 0 ? (totalDiscount / totalRevenue) * 100 : 0;
+
+    // 3. Build Daily Time Series (buckets) for charts
+    const buckets = new Map<string, {
+      date: string;
+      label: string;
+      transactions: number;
+      discount: number;
+      registrations: number;
+      revenue: number;
+    }>();
+
+    for (let i = days - 1; i >= 0; i--) {
+      const d = new Date(now.getTime() - i * 24 * 60 * 60 * 1000);
+      const key = d.toISOString().slice(0, 10);
+      buckets.set(key, {
+        date: key,
+        label: d.toLocaleDateString('en-IN', { day: '2-digit', month: 'short' }),
+        transactions: 0,
+        discount: 0,
+        registrations: 0,
+        revenue: 0,
+      });
+    }
+
+    allPeriodTransactions.forEach((t) => {
+      const key = new Date(t.createdAt).toISOString().slice(0, 10);
+      const b = buckets.get(key);
+      if (b) {
+        b.transactions += 1;
+        b.discount += (t.discountAmount || 0);
+        b.revenue += (t.amount || 0);
+      }
     });
+
+    periodCustomers.forEach((c) => {
+      const key = new Date(c.joinedAt).toISOString().slice(0, 10);
+      const b = buckets.get(key);
+      if (b) {
+        b.registrations += 1;
+      }
+    });
+
+    const series = Array.from(buckets.values());
+
+    // Calculate growth deltas (% change between first half of period and second half)
+    const half = Math.floor(series.length / 2);
+    const calcDelta = (key: 'transactions' | 'discount' | 'registrations') => {
+      const firstHalf = series.slice(0, half).reduce((s, p) => s + p[key], 0);
+      const secondHalf = series.slice(half).reduce((s, p) => s + p[key], 0);
+      if (!firstHalf) return 0;
+      return Number((((secondHalf - firstHalf) / firstHalf) * 100).toFixed(1));
+    };
+
+    const deltaRegistrations = calcDelta('registrations');
+    const deltaDiscount = calcDelta('discount');
+
+    // 4. Group distribution
+    const groupDistribution = groups.map((g) => {
+      const groupTxns = allPeriodTransactions.filter((t) => t.customer?.groupId === g.id);
+      return {
+        id: g.id,
+        name: g.name,
+        discountPercent: g.discountPercent,
+        active: g.active,
+        customers: g.customers.length,
+        transactions: groupTxns.length,
+        discountGenerated: groupTxns.reduce((s, t) => s + (t.discountAmount || 0), 0)
+      };
+    });
+
+    // 5. Worker activity (top workers by scans/transactions)
+    const allWorkers = await prisma.workerProfile.findMany({
+      where: { isDeleted: false },
+      select: {
+        id: true,
+        fullName: true,
+        scans: true,
+        transactions: {
+          where: { status: 'COMPLETED', createdAt: { gte: cutoff } },
+          select: { id: true, discountAmount: true }
+        }
+      }
+    });
+
+    const workerActivity = allWorkers
+      .map((w) => ({
+        id: w.id,
+        name: w.fullName ? w.fullName.split(' ')[0] : 'Worker',
+        scans: w.scans,
+        transactions: w.transactions.length,
+        discountProcessed: w.transactions.reduce((s, t) => s + (t.discountAmount || 0), 0)
+      }))
+      .sort((a, b) => b.scans - a.scans)
+      .slice(0, 8);
+
+    // 6. Map recent transactions with clean fields
+    const recentTransactions = recentTxnsRaw.map((t) => ({
+      id: t.id,
+      customerId: t.customerId,
+      customerName: t.customer?.fullName || 'Customer',
+      workerId: t.workerId,
+      workerName: t.worker?.fullName || 'Worker',
+      groupId: t.customer?.groupId || 'default',
+      amount: t.amount,
+      discountPercent: t.discountPercent,
+      discountAmount: t.discountAmount,
+      litres: t.litres,
+      fuel: t.fuelType,
+      createdAt: t.createdAt
+    }));
 
     res.status(200).json({
       success: true,
       data: {
-        totalCustomers,
-        totalWorkers,
-        totalTransactions: transactions._count.id,
-        totalRevenue: transactions._sum.amount || 0,
-        totalDiscount: transactions._sum.discountAmount || 0,
+        days,
+        overview: {
+          totalCustomers,
+          totalWorkers,
+          activeWorkers,
+          totalDiscount,
+          totalRevenue,
+          totalTransactions,
+          todayTransactions,
+          todayDiscount,
+          avgDiscountPercent,
+          deltaRegistrations,
+          deltaDiscount
+        },
+        series,
+        groupDistribution,
+        workerActivity,
+        recentTransactions
       }
     });
   } catch (error) {
@@ -64,14 +267,79 @@ export const getDashboard = async (req: Request, res: Response, next: NextFuncti
 
 export const getCustomers = async (req: Request, res: Response, next: NextFunction) => {
   try {
-    const { search } = req.query;
-    const whereClause = search ? { fullName: { contains: search as string, mode: 'insensitive' as any } } : {};
+    const page = Math.max(1, parseInt(req.query.page as string) || 1);
+    const limit = Math.max(1, parseInt((req.query.limit || req.query.pageSize) as string) || 10);
+    const isAll = req.query.all === 'true' || req.query.limit === '-1' || req.query.limit === '0';
+    const skip = (page - 1) * limit;
 
-    const customers = await prisma.customerProfile.findMany({
-      where: whereClause,
-      include: { group: true }
+    const { search, query: qSearch, q, groupId, status } = req.query;
+    const searchTerm = (search || qSearch || q) as string;
+
+    const whereClause: any = { isDeleted: false };
+
+    // 1. Search filter: name, mobile, email, id, vehicle, address
+    if (searchTerm && typeof searchTerm === 'string' && searchTerm.trim()) {
+      const s = searchTerm.trim();
+      whereClause.OR = [
+        { fullName: { contains: s, mode: 'insensitive' } },
+        { id: { contains: s, mode: 'insensitive' } },
+        { vehicle: { contains: s, mode: 'insensitive' } },
+        { address: { contains: s, mode: 'insensitive' } },
+        { user: { mobile: { contains: s, mode: 'insensitive' } } },
+        { user: { email: { contains: s, mode: 'insensitive' } } }
+      ];
+    }
+
+    // 2. Group filter
+    if (groupId && typeof groupId === 'string' && groupId !== 'all') {
+      if (groupId === 'unassigned' || groupId === 'grp-default' || groupId === 'null') {
+        whereClause.groupId = null;
+      } else {
+        whereClause.groupId = groupId;
+      }
+    }
+
+    // 3. Status filter
+    const validStatuses = ['PENDING', 'ACTIVE', 'SUSPENDED', 'INACTIVE', 'OFFLINE'];
+    if (status && typeof status === 'string' && status !== 'all') {
+      const upperStatus = status.toUpperCase();
+      if (validStatuses.includes(upperStatus)) {
+        whereClause.user = {
+          ...(whereClause.user || {}),
+          status: upperStatus
+        };
+      }
+    }
+
+    const [customers, total] = await Promise.all([
+      prisma.customerProfile.findMany({
+        where: whereClause,
+        include: {
+          user: true,
+          group: true,
+          transactions: {
+            where: { status: 'COMPLETED' },
+            include: { worker: true }
+          }
+        },
+        orderBy: { joinedAt: 'desc' },
+        ...(isAll ? {} : { skip, take: limit })
+      }),
+      prisma.customerProfile.count({ where: whereClause })
+    ]);
+
+    const totalPages = isAll ? 1 : (Math.ceil(total / limit) || 1);
+
+    res.status(200).json({
+      success: true,
+      data: customers,
+      pagination: {
+        page: isAll ? 1 : page,
+        limit: isAll ? total : limit,
+        total,
+        totalPages
+      }
     });
-    res.status(200).json({ success: true, data: customers });
   } catch (error) {
     next(error);
   }
@@ -79,13 +347,147 @@ export const getCustomers = async (req: Request, res: Response, next: NextFuncti
 
 export const getWorkers = async (req: Request, res: Response, next: NextFunction) => {
   try {
-    const workers = await prisma.workerProfile.findMany({
-      where: {
-        isDeleted: false
-      },
-      include: { user: true, station: true }
+    const page = Math.max(1, parseInt(req.query.page as string) || 1);
+    const limit = Math.max(1, parseInt((req.query.limit || req.query.pageSize) as string) || 10);
+    const isAll = req.query.all === 'true' || req.query.limit === '-1' || req.query.limit === '0';
+    const skip = (page - 1) * limit;
+
+    const { search, query: qSearch, q, status, shift, sortBy, sortOrder } = req.query;
+    const searchTerm = (search || qSearch || q) as string;
+    const orderDir = ((sortOrder as string)?.toLowerCase() === 'asc' ? 'asc' : 'desc') as 'asc' | 'desc';
+    const sortField = ((sortBy as string)?.toLowerCase() || 'joinedat');
+
+    const whereClause: any = { isDeleted: false };
+
+    // 1. Search filter: fullName, id, user.email, user.mobile
+    if (searchTerm && typeof searchTerm === 'string' && searchTerm.trim()) {
+      const s = searchTerm.trim();
+      whereClause.OR = [
+        { fullName: { contains: s, mode: 'insensitive' } },
+        { id: { contains: s, mode: 'insensitive' } },
+        { user: { email: { contains: s, mode: 'insensitive' } } },
+        { user: { mobile: { contains: s, mode: 'insensitive' } } },
+      ];
+    }
+
+    // 2. Status filter
+    const validStatuses = ['PENDING', 'ACTIVE', 'SUSPENDED', 'INACTIVE', 'OFFLINE'];
+    if (status && typeof status === 'string' && status !== 'all') {
+      const upperStatus = status.toUpperCase();
+      if (validStatuses.includes(upperStatus)) {
+        whereClause.user = {
+          ...(whereClause.user || {}),
+          status: upperStatus
+        };
+      }
+    }
+
+    // 3. Shift filter
+    if (shift && typeof shift === 'string' && shift !== 'all') {
+      whereClause.shift = { equals: shift, mode: 'insensitive' };
+    }
+
+    const formatWorkerItem = (w: any) => {
+      const txns = w.transactions || [];
+      const discount = txns.reduce((sum: number, t: any) => sum + (t.discountAmount || 0), 0);
+      const customers = new Set(txns.map((t: any) => t.customerId)).size;
+      let lastAct = w.joinedAt;
+      if (txns.length > 0) {
+        const sortedTxns = [...txns].sort((a: any, b: any) => new Date(b.createdAt).getTime() - new Date(a.createdAt).getTime());
+        lastAct = sortedTxns[0].createdAt;
+      }
+      return {
+        ...w,
+        transactions: txns.length,
+        discountProcessed: discount,
+        customersScanned: customers,
+        lastActivity: lastAct,
+      };
+    };
+
+    const isComputedSort = ['discount', 'customers', 'last', 'lastactivity'].includes(sortField);
+
+    let workers: any[] = [];
+    let total = 0;
+
+    if (isComputedSort) {
+      const allMatching = await prisma.workerProfile.findMany({
+        where: whereClause,
+        include: {
+          user: true,
+          station: true,
+          transactions: {
+            where: { status: 'COMPLETED' },
+            select: { id: true, customerId: true, amount: true, discountAmount: true, createdAt: true }
+          }
+        }
+      });
+      total = allMatching.length;
+      const formatted = allMatching.map(formatWorkerItem);
+      formatted.sort((a: any, b: any) => {
+        let valA: any = 0;
+        let valB: any = 0;
+        if (sortField === 'discount') {
+          valA = a.discountProcessed || 0;
+          valB = b.discountProcessed || 0;
+        } else if (sortField === 'customers') {
+          valA = a.customersScanned || 0;
+          valB = b.customersScanned || 0;
+        } else if (sortField === 'last' || sortField === 'lastactivity') {
+          valA = new Date(a.lastActivity).getTime();
+          valB = new Date(b.lastActivity).getTime();
+        }
+        return orderDir === 'asc' ? (valA > valB ? 1 : valA < valB ? -1 : 0) : (valA < valB ? 1 : valA > valB ? -1 : 0);
+      });
+      workers = isAll ? formatted : formatted.slice(skip, skip + limit);
+    } else {
+      let orderBy: any = { joinedAt: 'desc' };
+      if (sortField === 'name' || sortField === 'fullname') {
+        orderBy = { fullName: orderDir };
+      } else if (sortField === 'status') {
+        orderBy = { user: { status: orderDir } };
+      } else if (sortField === 'shift') {
+        orderBy = { shift: orderDir };
+      } else if (sortField === 'scans') {
+        orderBy = { scans: orderDir };
+      } else if (sortField === 'transactions') {
+        orderBy = { transactions: { _count: orderDir } };
+      } else if (sortField === 'joinedat') {
+        orderBy = { joinedAt: orderDir };
+      }
+
+      const [rawWorkers, count] = await Promise.all([
+        prisma.workerProfile.findMany({
+          where: whereClause,
+          include: {
+            user: true,
+            station: true,
+            transactions: {
+              where: { status: 'COMPLETED' },
+              select: { id: true, customerId: true, amount: true, discountAmount: true, createdAt: true }
+            }
+          },
+          orderBy,
+          ...(isAll ? {} : { skip, take: limit })
+        }),
+        prisma.workerProfile.count({ where: whereClause })
+      ]);
+      total = count;
+      workers = rawWorkers.map(formatWorkerItem);
+    }
+
+    const totalPages = isAll ? 1 : (Math.ceil(total / limit) || 1);
+
+    res.status(200).json({
+      success: true,
+      data: workers,
+      pagination: {
+        page: isAll ? 1 : page,
+        limit: isAll ? total : limit,
+        total,
+        totalPages
+      }
     });
-    res.status(200).json({ success: true, data: workers });
   } catch (error) {
     next(error);
   }
@@ -93,18 +495,24 @@ export const getWorkers = async (req: Request, res: Response, next: NextFunction
 
 export const createWorker = async (req: Request, res: Response, next: NextFunction) => {
   try {
-    const { fullName, email, mobile, password, shift, stationId } = req.body;
+    const workerFullName = req.body.fullName || req.body.name;
+    const email = req.body.email;
+    const mobile = req.body.mobile || req.body.phone;
+    const { password, shift, stationId, status } = req.body;
 
-    if (!fullName) {
+    if (!workerFullName) {
       return res.status(400).json({ success: false, message: 'Full name is required' });
     }
 
-    if (email || mobile) {
+    const cleanEmail = email && typeof email === 'string' && email.trim() ? email.trim() : null;
+    const cleanMobile = mobile && typeof mobile === 'string' && mobile.trim() ? mobile.trim() : null;
+
+    if (cleanEmail || cleanMobile) {
       const existingUser = await prisma.user.findFirst({
         where: {
           OR: [
-            ...(email ? [{ email }] : []),
-            ...(mobile ? [{ mobile }] : [])
+            ...(cleanEmail ? [{ email: cleanEmail }] : []),
+            ...(cleanMobile ? [{ mobile: cleanMobile }] : [])
           ]
         }
       });
@@ -118,17 +526,23 @@ export const createWorker = async (req: Request, res: Response, next: NextFuncti
       hashedPassword = await bcrypt.hash(password, 10);
     }
 
-    const worker = await prisma.user.create({
+    let stationConnect = undefined;
+    if (stationId && typeof stationId === 'string' && stationId.trim()) {
+      stationConnect = { connect: { id: stationId.trim() } };
+    }
+
+    const user = await prisma.user.create({
       data: {
-        email,
-        mobile,
+        email: cleanEmail,
+        mobile: cleanMobile,
         password: hashedPassword,
         role: 'WORKER',
+        status: status ? status.toUpperCase() : 'ACTIVE',
         workerProfile: {
           create: {
-            fullName,
-            shift,
-            stationId
+            fullName: workerFullName,
+            shift: shift || 'Morning',
+            ...(stationConnect && { station: stationConnect })
           }
         }
       },
@@ -141,7 +555,12 @@ export const createWorker = async (req: Request, res: Response, next: NextFuncti
       }
     });
 
-    res.status(201).json({ success: true, data: worker.workerProfile });
+    const fullWorker = await prisma.workerProfile.findUnique({
+      where: { userId: user.id },
+      include: { user: true, station: true }
+    });
+
+    res.status(201).json({ success: true, data: fullWorker });
   } catch (error) {
     next(error);
   }
@@ -168,7 +587,10 @@ export const getWorkerById = async (req: Request, res: Response, next: NextFunct
 export const updateWorker = async (req: Request, res: Response, next: NextFunction) => {
   try {
     const id = req.params.id as string;
-    const { fullName, email, mobile, password, shift, stationId, status } = req.body;
+    const workerFullName = req.body.fullName !== undefined ? req.body.fullName : req.body.name;
+    const email = req.body.email;
+    const mobile = req.body.mobile !== undefined ? req.body.mobile : req.body.phone;
+    const { password, shift, stationId, status } = req.body;
 
     const workerProfile = await prisma.workerProfile.findUnique({
       where: { id },
@@ -179,14 +601,17 @@ export const updateWorker = async (req: Request, res: Response, next: NextFuncti
       return res.status(404).json({ success: false, message: 'Worker not found' });
     }
 
+    const cleanEmail = email && typeof email === 'string' && email.trim() ? email.trim() : (email === null ? null : undefined);
+    const cleanMobile = mobile && typeof mobile === 'string' && mobile.trim() ? mobile.trim() : (mobile === null ? null : undefined);
+
     // Check for email or mobile uniqueness excluding current user
-    if (email || mobile) {
+    if (cleanEmail || cleanMobile) {
       const existingUser = await prisma.user.findFirst({
         where: {
           id: { not: workerProfile.userId },
           OR: [
-            ...(email ? [{ email }] : []),
-            ...(mobile ? [{ mobile }] : [])
+            ...(cleanEmail ? [{ email: cleanEmail }] : []),
+            ...(cleanMobile ? [{ mobile: cleanMobile }] : [])
           ]
         }
       });
@@ -200,16 +625,25 @@ export const updateWorker = async (req: Request, res: Response, next: NextFuncti
       hashedPassword = await bcrypt.hash(password, 10);
     }
 
+    let stationUpdate = undefined;
+    if (stationId !== undefined) {
+      if (stationId && typeof stationId === 'string' && stationId.trim()) {
+        stationUpdate = { connect: { id: stationId.trim() } };
+      } else {
+        stationUpdate = { disconnect: true };
+      }
+    }
+
     const updatedWorker = await prisma.workerProfile.update({
       where: { id },
       data: {
-        fullName: fullName !== undefined ? fullName : undefined,
+        fullName: workerFullName !== undefined ? workerFullName : undefined,
         shift: shift !== undefined ? shift : undefined,
-        stationId: stationId !== undefined ? stationId : undefined,
+        ...(stationUpdate !== undefined && { station: stationUpdate }),
         user: {
           update: {
-            email: email !== undefined ? email : undefined,
-            mobile: mobile !== undefined ? mobile : undefined,
+            ...(cleanEmail !== undefined && { email: cleanEmail }),
+            ...(cleanMobile !== undefined && { mobile: cleanMobile }),
             ...(hashedPassword && { password: hashedPassword }),
             ...(status && { status: status.toUpperCase() })
           }
@@ -286,8 +720,69 @@ export const getTransactions = async (req: Request, res: Response, next: NextFun
 
 export const getGroups = async (req: Request, res: Response, next: NextFunction) => {
   try {
-    const groups = await prisma.group.findMany();
-    res.status(200).json({ success: true, data: groups });
+    const groups = await prisma.group.findMany({
+      where: { isDeleted: false },
+      include: {
+        customers: {
+          where: { isDeleted: false },
+          select: {
+            id: true,
+            transactions: {
+              where: { status: 'COMPLETED' },
+              select: {
+                id: true,
+                amount: true,
+                discountAmount: true,
+              }
+            }
+          }
+        }
+      },
+      orderBy: { createdAt: 'asc' }
+    });
+
+    const totalGroupedCustomers = await prisma.customerProfile.count({
+      where: { isDeleted: false, groupId: { not: null } }
+    });
+
+    let overallDiscountGenerated = 0;
+
+    const data = groups.map(g => {
+      let groupTransactions = 0;
+      let groupDiscount = 0;
+      for (const customer of g.customers) {
+        groupTransactions += customer.transactions.length;
+        for (const txn of customer.transactions) {
+          groupDiscount += (txn.discountAmount || 0);
+        }
+      }
+      overallDiscountGenerated += groupDiscount;
+
+      return {
+        id: g.id,
+        name: g.name,
+        discountPercent: g.discountPercent,
+        description: g.description,
+        active: g.active,
+        isDefault: g.isDefault,
+        createdAt: g.createdAt,
+        updatedAt: g.updatedAt,
+        customersCount: g.customers.length,
+        transactionsCount: groupTransactions,
+        discountGenerated: groupDiscount,
+      };
+    });
+
+    res.status(200).json({
+      success: true,
+      data,
+      stats: {
+        totalGroups: groups.length,
+        activeGroups: groups.filter(g => g.active).length,
+        groupedCustomers: totalGroupedCustomers,
+        discountGenerated: overallDiscountGenerated,
+      }
+    });
   } catch (error) {
     next(error);
   }
@@ -340,69 +835,152 @@ export const getProfile = async (req: any, res: Response, next: NextFunction) =>
 };
 
 export const createCustomer = async (req: Request, res: Response, next: NextFunction) => {
-  try {
-    const { fullName, email, mobile, password, vehicle, groupId, address } = req.body;
-    if (!fullName) return res.status(400).json({ success: false, message: 'Full name is required' });
+    try {
+      const customerFullName = req.body.fullName || req.body.name;
+      const email = req.body.email;
+      const mobile = req.body.mobile || req.body.phone;
+      const { password, vehicle, groupId, address, status } = req.body;
+      if (!customerFullName) return res.status(400).json({ success: false, message: 'Full name is required' });
 
-    if (email || mobile) {
-      const existing = await prisma.user.findFirst({
-        where: { OR: [...(email ? [{ email }] : []), ...(mobile ? [{ mobile }] : [])] }
+      const cleanEmail = email && typeof email === 'string' && email.trim() ? email.trim() : null;
+      const cleanMobile = mobile && typeof mobile === 'string' && mobile.trim() ? mobile.trim() : null;
+
+      if (cleanEmail || cleanMobile) {
+        const existing = await prisma.user.findFirst({
+          where: { OR: [...(cleanEmail ? [{ email: cleanEmail }] : []), ...(cleanMobile ? [{ mobile: cleanMobile }] : [])] }
+        });
+        if (existing) {
+          if (cleanEmail && existing.email === cleanEmail) return res.status(409).json({ success: false, message: 'Email is already in use.' });
+          if (cleanMobile && existing.mobile === cleanMobile) return res.status(409).json({ success: false, message: 'Phone number is already in use.' });
+        }
+      }
+
+      const hashedPassword = password ? await bcrypt.hash(password, 10) : undefined;
+      const userStatus = status ? status.toUpperCase() : 'ACTIVE';
+
+      let groupConnect = undefined;
+      if (groupId && typeof groupId === 'string' && groupId.trim()) {
+        groupConnect = { connect: { id: groupId.trim() } };
+      }
+
+      const user = await prisma.user.create({
+        data: {
+          email: cleanEmail, mobile: cleanMobile, password: hashedPassword, role: 'CUSTOMER', status: userStatus as any,
+          customerProfile: {
+            create: {
+              fullName: customerFullName,
+              vehicle: vehicle !== undefined ? vehicle : undefined,
+              address: address !== undefined ? address : undefined,
+              ...(groupConnect && { group: groupConnect })
+            }
+          }
+        },
+        include: { customerProfile: { include: { group: true, user: true } } }
       });
-      if (existing) return res.status(409).json({ success: false, message: 'User already exists' });
-    }
+      
+      const customerProfile = await prisma.customerProfile.findUnique({
+        where: { userId: user.id },
+        include: { user: true, group: true }
+      });
 
-    const hashedPassword = password ? await bcrypt.hash(password, 10) : undefined;
-    
-    const customer = await prisma.user.create({
-      data: {
-        email, mobile, password: hashedPassword, role: 'CUSTOMER',
-        customerProfile: { create: { fullName, vehicle, groupId, address } }
-      },
-      include: { customerProfile: { include: { group: true } } }
-    });
-    res.status(201).json({ success: true, data: customer.customerProfile });
-  } catch (error) { next(error); }
-};
+      res.status(201).json({ success: true, data: customerProfile });
+    } catch (error) { next(error); }
+  };
 
 export const updateCustomer = async (req: Request, res: Response, next: NextFunction) => {
-  try {
-    const id = req.params.id as string;
-    const { fullName, email, mobile, password, vehicle, groupId, address, status } = req.body;
+    try {
+      const id = req.params.id as string;
+      const customerFullName = req.body.fullName !== undefined ? req.body.fullName : req.body.name;
+      const email = req.body.email;
+      const mobile = req.body.mobile !== undefined ? req.body.mobile : req.body.phone;
+      const { password, vehicle, groupId, address, status } = req.body;
 
-    const profile = await prisma.customerProfile.findUnique({ where: { id } });
-    if (!profile) return res.status(404).json({ success: false, message: 'Customer not found' });
+      const profile = await prisma.customerProfile.findUnique({ where: { id }, include: { user: true } });
+      if (!profile) return res.status(404).json({ success: false, message: 'Customer not found' });
 
-    const hashedPassword = password ? await bcrypt.hash(password, 10) : undefined;
-    const updated = await prisma.customerProfile.update({
-      where: { id },
-      data: {
-        fullName, vehicle, groupId, address,
-        user: { update: { email, mobile, ...(hashedPassword && { password: hashedPassword }), ...(status && { status: status as any }) } }
-      },
-      include: { user: true, group: true }
-    });
-    res.status(200).json({ success: true, data: updated });
-  } catch (error) { next(error); }
-};
+      const cleanEmail = email && typeof email === 'string' && email.trim() ? email.trim() : (email === null ? null : undefined);
+      const cleanMobile = mobile && typeof mobile === 'string' && mobile.trim() ? mobile.trim() : (mobile === null ? null : undefined);
+
+      if (cleanEmail || cleanMobile) {
+        const existing = await prisma.user.findFirst({
+          where: { 
+            id: { not: profile.userId },
+            OR: [...(cleanEmail ? [{ email: cleanEmail }] : []), ...(cleanMobile ? [{ mobile: cleanMobile }] : [])] 
+          }
+        });
+        if (existing) {
+          if (cleanEmail && existing.email === cleanEmail) return res.status(409).json({ success: false, message: 'Email is already in use.' });
+          if (cleanMobile && existing.mobile === cleanMobile) return res.status(409).json({ success: false, message: 'Phone number is already in use.' });
+        }
+      }
+
+      const hashedPassword = password ? await bcrypt.hash(password, 10) : undefined;
+      const userStatus = status ? status.toUpperCase() : undefined;
+
+      let groupUpdate = undefined;
+      if (groupId !== undefined) {
+        if (groupId && typeof groupId === 'string' && groupId.trim()) {
+          groupUpdate = { connect: { id: groupId.trim() } };
+        } else {
+          groupUpdate = { disconnect: true };
+        }
+      }
+
+      const updated = await prisma.customerProfile.update({
+        where: { id },
+        data: {
+          fullName: customerFullName !== undefined ? customerFullName : undefined,
+          vehicle: vehicle !== undefined ? vehicle : undefined,
+          address: address !== undefined ? address : undefined,
+          ...(groupUpdate !== undefined && { group: groupUpdate }),
+          user: { update: { ...(cleanEmail !== undefined && { email: cleanEmail }), ...(cleanMobile !== undefined && { mobile: cleanMobile }), ...(hashedPassword && { password: hashedPassword }), ...(userStatus && { status: userStatus as any }) } }
+        },
+        include: { user: true, group: true }
+      });
+      res.status(200).json({ success: true, data: updated });
+    } catch (error) { next(error); }
+  };
 
 export const deleteCustomer = async (req: Request, res: Response, next: NextFunction) => {
-  try {
-    const id = req.params.id as string;
-    const profile = await prisma.customerProfile.findUnique({ where: { id } });
-    if (!profile) return res.status(404).json({ success: false, message: 'Customer not found' });
-    await prisma.$transaction([
-      prisma.customerProfile.delete({ where: { id } }),
-      prisma.user.delete({ where: { id: profile.userId } })
-    ]);
-    res.status(200).json({ success: true, message: 'Customer deleted' });
-  } catch (error) { next(error); }
-};
+    try {
+      const id = req.params.id as string;
+      const profile = await prisma.customerProfile.findUnique({ where: { id } });
+      if (!profile) return res.status(404).json({ success: false, message: 'Customer not found' });
+      await prisma.$transaction([
+        prisma.customerProfile.update({ where: { id }, data: { isDeleted: true } }),
+        prisma.user.update({ where: { id: profile.userId }, data: { status: 'INACTIVE' } })
+      ]);
+      res.status(200).json({ success: true, message: 'Customer deleted' });
+    } catch (error) { next(error); }
+  };
 
 export const createGroup = async (req: Request, res: Response, next: NextFunction) => {
   try {
     const { name, discountPercent, description, isDefault } = req.body;
-    const group = await prisma.group.create({ data: { name, discountPercent, description, isDefault } });
-    res.status(201).json({ success: true, data: group });
+    if (!name || typeof name !== 'string' || !name.trim()) {
+      return res.status(400).json({ success: false, message: 'Group name is required' });
+    }
+    const parsedDiscount = parseFloat(discountPercent);
+    if (isNaN(parsedDiscount) || parsedDiscount < 0 || parsedDiscount > 100) {
+      return res.status(400).json({ success: false, message: 'Discount percentage must be between 0 and 100' });
+    }
+    const group = await prisma.group.create({
+      data: {
+        name: name.trim(),
+        discountPercent: parsedDiscount,
+        description: description ? description.trim() : null,
+        isDefault: Boolean(isDefault),
+      }
+    });
+    res.status(201).json({
+      success: true,
+      data: {
+        ...group,
+        customersCount: 0,
+        transactionsCount: 0,
+        discountGenerated: 0,
+      }
+    });
   } catch (error) { next(error); }
 };
 
@@ -410,27 +988,129 @@ export const updateGroup = async (req: Request, res: Response, next: NextFunctio
   try {
     const id = req.params.id as string;
     const { name, discountPercent, description, isDefault, active } = req.body;
+    const data: any = {};
+    if (name !== undefined) {
+      if (!name || typeof name !== 'string' || !name.trim()) {
+        return res.status(400).json({ success: false, message: 'Group name is required' });
+      }
+      data.name = name.trim();
+    }
+    if (discountPercent !== undefined) {
+      const parsedDiscount = parseFloat(discountPercent);
+      if (isNaN(parsedDiscount) || parsedDiscount < 0 || parsedDiscount > 100) {
+        return res.status(400).json({ success: false, message: 'Discount percentage must be between 0 and 100' });
+      }
+      data.discountPercent = parsedDiscount;
+    }
+    if (description !== undefined) {
+      data.description = description ? description.trim() : null;
+    }
+    if (isDefault !== undefined) {
+      data.isDefault = Boolean(isDefault);
+    }
+    if (active !== undefined) {
+      data.active = Boolean(active);
+    }
     const group = await prisma.group.update({
-      where: { id }, data: { name, discountPercent, description, isDefault, active }
+      where: { id },
+      data,
+      include: {
+        customers: {
+          where: { isDeleted: false },
+          select: {
+            id: true,
+            transactions: {
+              where: { status: 'COMPLETED' },
+              select: { amount: true, discountAmount: true }
+            }
+          }
+        }
+      }
     });
-    res.status(200).json({ success: true, data: group });
+
+    let groupTransactions = 0;
+    let groupDiscount = 0;
+    for (const customer of group.customers) {
+      groupTransactions += customer.transactions.length;
+      for (const txn of customer.transactions) {
+        groupDiscount += (txn.discountAmount || 0);
+      }
+    }
+
+    res.status(200).json({
+      success: true,
+      data: {
+        id: group.id,
+        name: group.name,
+        discountPercent: group.discountPercent,
+        description: group.description,
+        active: group.active,
+        isDefault: group.isDefault,
+        createdAt: group.createdAt,
+        updatedAt: group.updatedAt,
+        customersCount: group.customers.length,
+        transactionsCount: groupTransactions,
+        discountGenerated: groupDiscount,
+      }
+    });
   } catch (error) { next(error); }
 };
 
 export const toggleGroupActive = async (req: Request, res: Response, next: NextFunction) => {
   try {
     const id = req.params.id as string;
-    const group = await prisma.group.findUnique({ where: { id } });
+    const group = await prisma.group.findUnique({
+      where: { id },
+      include: {
+        customers: {
+          where: { isDeleted: false },
+          select: {
+            id: true,
+            transactions: {
+              where: { status: 'COMPLETED' },
+              select: { amount: true, discountAmount: true }
+            }
+          }
+        }
+      }
+    });
     if (!group) return res.status(404).json({ success: false, message: 'Group not found' });
     const updated = await prisma.group.update({ where: { id }, data: { active: !group.active } });
-    res.status(200).json({ success: true, data: updated });
+
+    let groupTransactions = 0;
+    let groupDiscount = 0;
+    for (const customer of group.customers) {
+      groupTransactions += customer.transactions.length;
+      for (const txn of customer.transactions) {
+        groupDiscount += (txn.discountAmount || 0);
+      }
+    }
+
+    res.status(200).json({
+      success: true,
+      data: {
+        ...updated,
+        customersCount: group.customers.length,
+        transactionsCount: groupTransactions,
+        discountGenerated: groupDiscount,
+      }
+    });
   } catch (error) { next(error); }
 };
 
 export const deleteGroup = async (req: Request, res: Response, next: NextFunction) => {
   try {
     const id = req.params.id as string;
-    await prisma.group.delete({ where: { id } });
+    // Safely unassign customers from this group first
+    await prisma.customerProfile.updateMany({
+      where: { groupId: id },
+      data: { groupId: null }
+    });
+    // Soft delete: update isDeleted to true in database
+    await prisma.group.update({
+      where: { id },
+      data: { isDeleted: true, active: false }
+    });
     res.status(200).json({ success: true, message: 'Group deleted' });
   } catch (error) { next(error); }
 };
