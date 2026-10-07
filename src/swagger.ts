@@ -18,7 +18,6 @@ const swaggerDocument = {
     }
   },
   paths: {
-<<<<<<< Updated upstream
     '/api/v1/admin/auth/forgot-password': {
       post: {
         summary: 'Request password reset link',
@@ -114,8 +113,6 @@ const swaggerDocument = {
         }
       }
     },
-=======
->>>>>>> Stashed changes
     '/api/v1/admin/profile': {
       get: {
         summary: 'Get Admin Profile',
@@ -180,7 +177,6 @@ const swaggerDocument = {
           '401': { description: 'Invalid current password' }
         }
       }
-<<<<<<< Updated upstream
     },
     '/api/v1/admin/auth/verify-reset-token': {
       get: {
@@ -218,8 +214,6 @@ const swaggerDocument = {
           }
         }
       }
-=======
->>>>>>> Stashed changes
     }
   }
 };
