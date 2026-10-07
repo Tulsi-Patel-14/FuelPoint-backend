@@ -2,8 +2,32 @@ import { Request, Response, NextFunction } from 'express';
 import { PrismaClient } from '@prisma/client';
 import { generateTokens } from '../../utils/jwt';
 import bcrypt from 'bcrypt';
+import crypto from 'crypto';
+import { sendPasswordResetEmail } from '../../utils/email';
 
 const prisma = new PrismaClient();
+
+// In-memory rate limiting map for forgot password requests (max 5 requests per 15 mins per IP/email)
+const resetRateLimitMap = new Map<string, { count: number; firstRequest: number }>();
+
+const isRateLimited = (key: string): boolean => {
+  const now = Date.now();
+  const windowMs = 15 * 60 * 1000; // 15 minutes
+  const maxRequests = 5;
+
+  const record = resetRateLimitMap.get(key);
+  if (!record || now - record.firstRequest > windowMs) {
+    resetRateLimitMap.set(key, { count: 1, firstRequest: now });
+    return false;
+  }
+
+  if (record.count >= maxRequests) {
+    return true;
+  }
+
+  record.count += 1;
+  return false;
+};
 
 export const login = async (req: Request, res: Response, next: NextFunction) => {
   try {
@@ -31,6 +55,170 @@ export const login = async (req: Request, res: Response, next: NextFunction) => 
         token: accessToken,
         admin: user.adminProfile
       }
+    });
+  } catch (error) {
+    next(error);
+  }
+};
+
+export const forgotPassword = async (req: Request, res: Response, next: NextFunction) => {
+  try {
+    const { email } = req.body;
+
+    // Validate email presence and format
+    if (!email || typeof email !== 'string' || !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email.trim())) {
+      return res.status(400).json({ success: false, message: 'Please enter a valid email address.' });
+    }
+
+    const normalizedEmail = email.trim().toLowerCase();
+    const clientIp = req.ip || req.socket.remoteAddress || 'unknown';
+
+    // Rate limit per IP and per normalized email
+    if (isRateLimited(`ip:${clientIp}`) || isRateLimited(`email:${normalizedEmail}`)) {
+      return res.status(429).json({
+        success: false,
+        message: 'Too many password reset requests. Please try again in 15 minutes.'
+      });
+    }
+
+    // Generic response message to prevent email/account enumeration
+    const genericResponse = {
+      success: true,
+      message: 'If an account exists for this email, a password reset link has been sent.'
+    };
+
+    const user = await prisma.user.findFirst({
+      where: {
+        email: { equals: normalizedEmail, mode: 'insensitive' },
+        role: { in: ['ADMIN', 'SUPER_ADMIN'] }
+      },
+      include: { adminProfile: true }
+    });
+
+    // If account doesn't exist, return identical generic response
+    if (!user) {
+      return res.status(200).json(genericResponse);
+    }
+
+    // 1. Invalidate any existing unused reset tokens for this user
+    await prisma.passwordResetToken.updateMany({
+      where: { userId: user.id, usedAt: null },
+      data: { usedAt: new Date() }
+    });
+
+    // 2. Clean up expired tokens
+    await prisma.passwordResetToken.deleteMany({
+      where: { expiresAt: { lt: new Date() } }
+    });
+
+    // 3. Generate cryptographically secure random token (64 hex characters)
+    const rawToken = crypto.randomBytes(32).toString('hex');
+
+    // 4. Compute SHA-256 hash for database storage (never store raw token)
+    const tokenHash = crypto.createHash('sha256').update(rawToken).digest('hex');
+
+    // 5. Expiration time (default 30 mins)
+    const expiresMinutes = parseInt(process.env.PASSWORD_RESET_TOKEN_EXPIRES_MINUTES || '30', 10);
+    const expiresAt = new Date(Date.now() + expiresMinutes * 60 * 1000);
+
+    await prisma.passwordResetToken.create({
+      data: {
+        userId: user.id,
+        tokenHash,
+        expiresAt
+      }
+    });
+
+    // 6. Build reset URL using configured FRONTEND_URL
+    const frontendUrl = (process.env.FRONTEND_URL || 'http://localhost:8080').replace(/\/+$/, '');
+    const resetUrl = `${frontendUrl}/reset-password?token=${rawToken}`;
+
+    // 7. Send email via SMTP
+    try {
+      await sendPasswordResetEmail(user.email || normalizedEmail, resetUrl, user.adminProfile?.fullName);
+    } catch (mailError) {
+      console.error('[EMAIL ERROR] Failed to dispatch password reset email:', mailError);
+    }
+
+    return res.status(200).json(genericResponse);
+  } catch (error) {
+    next(error);
+  }
+};
+
+export const resetPassword = async (req: Request, res: Response, next: NextFunction) => {
+  try {
+    const { token, password, confirmPassword } = req.body;
+
+    if (!token || typeof token !== 'string' || !token.trim()) {
+      return res.status(400).json({
+        success: false,
+        message: 'This password reset link is invalid or has expired.'
+      });
+    }
+
+    if (!password || typeof password !== 'string' || password.length < 8) {
+      return res.status(400).json({
+        success: false,
+        message: 'Password must be at least 8 characters long.'
+      });
+    }
+
+    if (confirmPassword !== undefined && password !== confirmPassword) {
+      return res.status(400).json({
+        success: false,
+        message: 'Passwords do not match.'
+      });
+    }
+
+    // Hash supplied raw token to match against database hash
+    const tokenHash = crypto.createHash('sha256').update(token.trim()).digest('hex');
+
+    const tokenRecord = await prisma.passwordResetToken.findUnique({
+      where: { tokenHash },
+      include: { user: true }
+    });
+
+    const now = new Date();
+    // Validate token exists, has not been used, and has not expired
+    if (!tokenRecord || tokenRecord.usedAt !== null || tokenRecord.expiresAt < now) {
+      return res.status(400).json({
+        success: false,
+        message: 'This password reset link is invalid or has expired.'
+      });
+    }
+
+    const user = tokenRecord.user;
+    if (!user || (user.role !== 'ADMIN' && user.role !== 'SUPER_ADMIN')) {
+      return res.status(400).json({
+        success: false,
+        message: 'This password reset link is invalid or has expired.'
+      });
+    }
+
+    // Hash new password with existing bcrypt mechanism (same as seed/admin controller)
+    const hashedPassword = await bcrypt.hash(password, 10);
+
+    // Atomically update password and mark reset token as used
+    await prisma.$transaction([
+      prisma.user.update({
+        where: { id: user.id },
+        data: { password: hashedPassword }
+      }),
+      prisma.passwordResetToken.update({
+        where: { id: tokenRecord.id },
+        data: { usedAt: now }
+      }),
+      // Invalidate any other outstanding reset tokens for this user
+      prisma.passwordResetToken.updateMany({
+        where: { userId: user.id, usedAt: null, id: { not: tokenRecord.id } },
+        data: { usedAt: now }
+      })
+    ]);
+
+    return res.status(200).json({
+      success: true,
+      message: 'Password reset successfully.'
     });
   } catch (error) {
     next(error);

@@ -1,6 +1,6 @@
 import { Router } from 'express';
 import { 
-  login, getDashboard, getProfile,
+  login, forgotPassword, resetPassword, getDashboard, getProfile,
   getCustomers, createCustomer, updateCustomer, deleteCustomer,
   getWorkers, createWorker, getWorkerById, updateWorker, deleteWorker,
   getTransactions, 
@@ -23,6 +23,8 @@ import { Role } from '@prisma/client';
 const router = Router();
 
 router.post('/auth/login', login);
+router.post('/auth/forgot-password', forgotPassword);
+router.post('/auth/reset-password', resetPassword);
 
 router.use(authMiddleware);
 router.use(roleMiddleware([Role.ADMIN, Role.SUPER_ADMIN]));
