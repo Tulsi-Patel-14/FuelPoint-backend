@@ -1226,6 +1226,7 @@ export const uploadProfileImage = async (req: any, res: Response, next: NextFunc
   }
 };
 
+<<<<<<< Updated upstream
 export const globalSearch = async (req: Request, res: Response, next: NextFunction) => {
   try {
     const q = req.query.q as string;
@@ -1268,6 +1269,8 @@ export const globalSearch = async (req: Request, res: Response, next: NextFuncti
   }
 };
 
+=======
+>>>>>>> Stashed changes
 export const createCustomer = async (req: Request, res: Response, next: NextFunction) => {
     try {
       const customerFullName = req.body.fullName || req.body.name;

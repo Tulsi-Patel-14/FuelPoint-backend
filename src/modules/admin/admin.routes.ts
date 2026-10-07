@@ -1,11 +1,19 @@
 import { Router } from 'express';
 import { 
+<<<<<<< Updated upstream
   login, forgotPassword, resetPassword, verifyResetToken, getDashboard, getProfile, updateProfile, changePassword,
+=======
+  login, getDashboard, getProfile, updateProfile, changePassword,
+>>>>>>> Stashed changes
   getCustomers, createCustomer, updateCustomer, deleteCustomer,
   getWorkers, createWorker, getWorkerById, updateWorker, deleteWorker,
   getTransactions, 
   getGroups, createGroup, updateGroup, toggleGroupActive, deleteGroup,
+<<<<<<< Updated upstream
   getNotifications, markNotificationRead, markAllNotificationsRead, uploadProfileImage, globalSearch
+=======
+  getNotifications, markNotificationRead, markAllNotificationsRead, uploadProfileImage
+>>>>>>> Stashed changes
 } from './admin.controller';
 import {
   getStations, getStationById, createStation, updateStation, deleteStation,
@@ -52,8 +60,11 @@ router.patch('/profile', updateProfile);
 router.patch('/profile/password', changePassword);
 router.put('/profile/password', changePassword);
 router.post('/profile/upload', upload.single('profileImage'), uploadProfileImage);
+<<<<<<< Updated upstream
 
 router.get('/search', globalSearch);
+=======
+>>>>>>> Stashed changes
 
 // Customers
 router.get('/customers', getCustomers);
