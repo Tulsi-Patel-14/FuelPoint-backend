@@ -580,6 +580,43 @@ export const getCustomers = async (req: Request, res: Response, next: NextFuncti
   }
 };
 
+export const getCustomersSummary = async (req: Request, res: Response, next: NextFunction) => {
+  try {
+    const sevenDaysAgo = new Date(Date.now() - 7 * 24 * 60 * 60 * 1000);
+    const thirtyDaysAgo = new Date(Date.now() - 30 * 24 * 60 * 60 * 1000);
+
+    const [totalCustomers, newRegistrations7d, activeCustomers, usedPumpCount] = await Promise.all([
+      prisma.customerProfile.count({
+        where: { isDeleted: false }
+      }),
+      prisma.customerProfile.count({
+        where: { isDeleted: false, joinedAt: { gte: sevenDaysAgo } }
+      }),
+      prisma.customerProfile.count({
+        where: { isDeleted: false, user: { status: 'ACTIVE' } }
+      }),
+      prisma.customerProfile.count({
+        where: {
+          isDeleted: false,
+          transactions: { some: { status: 'COMPLETED', createdAt: { gte: thirtyDaysAgo } } }
+        }
+      })
+    ]);
+
+    res.status(200).json({
+      success: true,
+      data: {
+        totalCustomers,
+        newRegistrations7d,
+        activeCustomers,
+        usedPumpCustomers: usedPumpCount,
+      }
+    });
+  } catch (error) {
+    next(error);
+  }
+};
+
 export const getWorkers = async (req: Request, res: Response, next: NextFunction) => {
   try {
     const page = Math.max(1, parseInt(req.query.page as string) || 1);
@@ -721,6 +758,39 @@ export const getWorkers = async (req: Request, res: Response, next: NextFunction
         limit: isAll ? total : limit,
         total,
         totalPages
+      }
+    });
+  } catch (error) {
+    next(error);
+  }
+};
+
+export const getWorkersSummary = async (req: Request, res: Response, next: NextFunction) => {
+  try {
+    const [totalWorkers, activeWorkers, scansAgg, discountAgg] = await Promise.all([
+      prisma.workerProfile.count({
+        where: { isDeleted: false }
+      }),
+      prisma.workerProfile.count({
+        where: { isDeleted: false, user: { status: 'ACTIVE' } }
+      }),
+      prisma.workerProfile.aggregate({
+        where: { isDeleted: false },
+        _sum: { scans: true }
+      }),
+      prisma.transaction.aggregate({
+        where: { status: 'COMPLETED', worker: { isDeleted: false } },
+        _sum: { discountAmount: true }
+      })
+    ]);
+
+    res.status(200).json({
+      success: true,
+      data: {
+        totalWorkers,
+        activeWorkers,
+        totalScans: scansAgg._sum.scans || 0,
+        discountProcessed: discountAgg._sum.discountAmount || 0,
       }
     });
   } catch (error) {
@@ -1014,6 +1084,51 @@ export const getGroups = async (req: Request, res: Response, next: NextFunction)
       stats: {
         totalGroups: groups.length,
         activeGroups: groups.filter(g => g.active).length,
+        groupedCustomers: totalGroupedCustomers,
+        discountGenerated: overallDiscountGenerated,
+      }
+    });
+  } catch (error) {
+    next(error);
+  }
+};
+
+export const getGroupsSummary = async (req: Request, res: Response, next: NextFunction) => {
+  try {
+    const [totalGroups, activeGroups, totalGroupedCustomers, groupsWithTxns] = await Promise.all([
+      prisma.group.count({ where: { isDeleted: false } }),
+      prisma.group.count({ where: { isDeleted: false, active: true } }),
+      prisma.customerProfile.count({ where: { isDeleted: false, groupId: { not: null } } }),
+      prisma.group.findMany({
+        where: { isDeleted: false },
+        select: {
+          customers: {
+            where: { isDeleted: false },
+            select: {
+              transactions: {
+                where: { status: 'COMPLETED' },
+                select: { discountAmount: true }
+              }
+            }
+          }
+        }
+      })
+    ]);
+
+    let overallDiscountGenerated = 0;
+    for (const g of groupsWithTxns) {
+      for (const c of g.customers) {
+        for (const t of c.transactions) {
+          overallDiscountGenerated += (t.discountAmount || 0);
+        }
+      }
+    }
+
+    res.status(200).json({
+      success: true,
+      data: {
+        totalGroups,
+        activeGroups,
         groupedCustomers: totalGroupedCustomers,
         discountGenerated: overallDiscountGenerated,
       }
