@@ -81,12 +81,6 @@ export const forgotPassword = async (req: Request, res: Response, next: NextFunc
       });
     }
 
-    // Generic response message to prevent email/account enumeration
-    const genericResponse = {
-      success: true,
-      message: 'If an account exists for this email, a password reset link has been sent.'
-    };
-
     const user = await prisma.user.findFirst({
       where: {
         email: { equals: normalizedEmail, mode: 'insensitive' },
@@ -95,9 +89,12 @@ export const forgotPassword = async (req: Request, res: Response, next: NextFunc
       include: { adminProfile: true }
     });
 
-    // If account doesn't exist, return identical generic response
+    // If account doesn't exist in database, DO NOT generate token or send email
     if (!user) {
-      return res.status(200).json(genericResponse);
+      return res.status(404).json({
+        success: false,
+        message: 'No administrator account found with this email address.'
+      });
     }
 
     // 1. Invalidate any existing unused reset tokens for this user
@@ -140,7 +137,10 @@ export const forgotPassword = async (req: Request, res: Response, next: NextFunc
       console.error('[EMAIL ERROR] Failed to dispatch password reset email:', mailError);
     }
 
-    return res.status(200).json(genericResponse);
+    return res.status(200).json({
+      success: true,
+      message: 'Password reset link has been sent to your email.'
+    });
   } catch (error) {
     next(error);
   }
