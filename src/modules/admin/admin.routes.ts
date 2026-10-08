@@ -1,10 +1,10 @@
 import { Router } from 'express';
 import { 
   login, forgotPassword, resetPassword, verifyResetToken, getDashboard, getProfile, updateProfile, changePassword,
-  getCustomers, createCustomer, updateCustomer, deleteCustomer,
-  getWorkers, createWorker, getWorkerById, updateWorker, deleteWorker,
+  getCustomers, getCustomersSummary, createCustomer, updateCustomer, deleteCustomer,
+  getWorkers, getWorkersSummary, createWorker, getWorkerById, updateWorker, deleteWorker,
   getTransactions, 
-  getGroups, createGroup, updateGroup, toggleGroupActive, deleteGroup,
+  getGroups, getGroupsSummary, createGroup, updateGroup, toggleGroupActive, deleteGroup,
   getNotifications, markNotificationRead, markAllNotificationsRead, uploadProfileImage, globalSearch
 } from './admin.controller';
 import {
@@ -56,12 +56,14 @@ router.post('/profile/upload', upload.single('profileImage'), uploadProfileImage
 router.get('/search', globalSearch);
 
 // Customers
+router.get('/customers/summary', getCustomersSummary);
 router.get('/customers', getCustomers);
 router.post('/customers', createCustomer);
 router.put('/customers/:id', updateCustomer);
 router.delete('/customers/:id', deleteCustomer);
 
 // Workers
+router.get('/workers/summary', getWorkersSummary);
 router.get('/workers', getWorkers);
 router.post('/workers', createWorker);
 router.get('/workers/:id', getWorkerById);
@@ -72,6 +74,7 @@ router.delete('/workers/:id', deleteWorker);
 router.get('/transactions', getTransactions);
 
 // Groups
+router.get('/groups/summary', getGroupsSummary);
 router.get('/groups', getGroups);
 router.post('/groups', createGroup);
 router.put('/groups/:id', updateGroup);
