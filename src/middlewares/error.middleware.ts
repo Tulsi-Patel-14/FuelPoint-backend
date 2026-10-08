@@ -15,7 +15,14 @@ export const errorHandler = (
   res: Response,
   next: NextFunction
 ) => {
-  console.error(err);
+  // Log full error details — Prisma errors included
+  console.error('=== ERROR HANDLER ===');
+  console.error('Name   :', err.name);
+  console.error('Message:', err.message);
+  if ((err as any).code)  console.error('Code   :', (err as any).code);
+  if ((err as any).meta)  console.error('Meta   :', JSON.stringify((err as any).meta, null, 2));
+  console.error('Stack  :', err.stack);
+  console.error('=====================');
 
   if (err instanceof AppError) {
     return res.status(err.statusCode).json({
