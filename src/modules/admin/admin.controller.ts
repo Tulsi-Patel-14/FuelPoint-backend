@@ -2,8 +2,32 @@ import { Request, Response, NextFunction } from 'express';
 import { PrismaClient } from '@prisma/client';
 import { generateTokens } from '../../utils/jwt';
 import bcrypt from 'bcrypt';
+import crypto from 'crypto';
+import { sendPasswordResetEmail } from '../../utils/email';
 
 const prisma = new PrismaClient();
+
+// In-memory rate limiting map for forgot password requests (max 5 requests per 15 mins per IP/email)
+const resetRateLimitMap = new Map<string, { count: number; firstRequest: number }>();
+
+const isRateLimited = (key: string): boolean => {
+  const now = Date.now();
+  const windowMs = 15 * 60 * 1000; // 15 minutes
+  const maxRequests = 5;
+
+  const record = resetRateLimitMap.get(key);
+  if (!record || now - record.firstRequest > windowMs) {
+    resetRateLimitMap.set(key, { count: 1, firstRequest: now });
+    return false;
+  }
+
+  if (record.count >= maxRequests) {
+    return true;
+  }
+
+  record.count += 1;
+  return false;
+};
 
 export const login = async (req: Request, res: Response, next: NextFunction) => {
   try {
@@ -31,6 +55,217 @@ export const login = async (req: Request, res: Response, next: NextFunction) => 
         token: accessToken,
         admin: user.adminProfile
       }
+    });
+  } catch (error) {
+    next(error);
+  }
+};
+
+export const forgotPassword = async (req: Request, res: Response, next: NextFunction) => {
+  try {
+    const { email } = req.body;
+
+    // Validate email presence and format
+    if (!email || typeof email !== 'string' || !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email.trim())) {
+      return res.status(400).json({ success: false, message: 'Please enter a valid email address.' });
+    }
+
+    const normalizedEmail = email.trim().toLowerCase();
+    const clientIp = req.ip || req.socket.remoteAddress || 'unknown';
+
+    // Rate limit per IP and per normalized email
+    if (isRateLimited(`ip:${clientIp}`) || isRateLimited(`email:${normalizedEmail}`)) {
+      return res.status(429).json({
+        success: false,
+        message: 'Too many password reset requests. Please try again in 15 minutes.'
+      });
+    }
+
+    // Generic response message to prevent email/account enumeration
+    const genericResponse = {
+      success: true,
+      message: 'If an account exists for this email, a password reset link has been sent.'
+    };
+
+    const user = await prisma.user.findFirst({
+      where: {
+        email: { equals: normalizedEmail, mode: 'insensitive' },
+        role: { in: ['ADMIN', 'SUPER_ADMIN'] }
+      },
+      include: { adminProfile: true }
+    });
+
+    // If account doesn't exist, return identical generic response
+    if (!user) {
+      return res.status(200).json(genericResponse);
+    }
+
+    // 1. Invalidate any existing unused reset tokens for this user
+    await prisma.passwordResetToken.updateMany({
+      where: { userId: user.id, usedAt: null },
+      data: { usedAt: new Date() }
+    });
+
+    // 2. Clean up expired tokens
+    await prisma.passwordResetToken.deleteMany({
+      where: { expiresAt: { lt: new Date() } }
+    });
+
+    // 3. Generate cryptographically secure random token (64 hex characters)
+    const rawToken = crypto.randomBytes(32).toString('hex');
+
+    // 4. Compute SHA-256 hash for database storage (never store raw token)
+    const tokenHash = crypto.createHash('sha256').update(rawToken).digest('hex');
+
+    // 5. Expiration time (default 30 mins)
+    const expiresMinutes = parseInt(process.env.PASSWORD_RESET_TOKEN_EXPIRES_MINUTES || '30', 10);
+    const expiresAt = new Date(Date.now() + expiresMinutes * 60 * 1000);
+
+    await prisma.passwordResetToken.create({
+      data: {
+        userId: user.id,
+        tokenHash,
+        expiresAt
+      }
+    });
+
+    // 6. Build reset URL using configured FRONTEND_URL
+    const frontendUrl = (process.env.FRONTEND_URL || 'http://localhost:8080').replace(/\/+$/, '');
+    const resetUrl = `${frontendUrl}/reset-password?token=${rawToken}`;
+
+    // 7. Send email via SMTP
+    try {
+      await sendPasswordResetEmail(user.email || normalizedEmail, resetUrl, user.adminProfile?.fullName);
+    } catch (mailError) {
+      console.error('[EMAIL ERROR] Failed to dispatch password reset email:', mailError);
+    }
+
+    return res.status(200).json(genericResponse);
+  } catch (error) {
+    next(error);
+  }
+};
+
+export const resetPassword = async (req: Request, res: Response, next: NextFunction) => {
+  try {
+    const { token, password, confirmPassword } = req.body;
+
+    if (!token || typeof token !== 'string' || !token.trim()) {
+      return res.status(400).json({
+        success: false,
+        message: 'This password reset link is invalid or has expired.'
+      });
+    }
+
+    if (!password || typeof password !== 'string' || password.length < 8) {
+      return res.status(400).json({
+        success: false,
+        message: 'Password must be at least 8 characters long.'
+      });
+    }
+
+    if (confirmPassword !== undefined && password !== confirmPassword) {
+      return res.status(400).json({
+        success: false,
+        message: 'Passwords do not match.'
+      });
+    }
+
+    // Hash supplied raw token to match against database hash
+    const tokenHash = crypto.createHash('sha256').update(token.trim()).digest('hex');
+
+    const tokenRecord = await prisma.passwordResetToken.findUnique({
+      where: { tokenHash },
+      include: { user: true }
+    });
+
+    const now = new Date();
+    // Validate token exists, has not been used, and has not expired
+    if (!tokenRecord || tokenRecord.usedAt !== null || tokenRecord.expiresAt < now) {
+      return res.status(400).json({
+        success: false,
+        message: 'This password reset link is invalid or has expired.'
+      });
+    }
+
+    const user = tokenRecord.user;
+    if (!user || (user.role !== 'ADMIN' && user.role !== 'SUPER_ADMIN')) {
+      return res.status(400).json({
+        success: false,
+        message: 'This password reset link is invalid or has expired.'
+      });
+    }
+
+    // Hash new password with existing bcrypt mechanism (same as seed/admin controller)
+    const hashedPassword = await bcrypt.hash(password, 10);
+
+    // Atomically update password and mark reset token as used
+    await prisma.$transaction([
+      prisma.user.update({
+        where: { id: user.id },
+        data: { password: hashedPassword }
+      }),
+      prisma.passwordResetToken.update({
+        where: { id: tokenRecord.id },
+        data: { usedAt: now }
+      }),
+      // Invalidate any other outstanding reset tokens for this user
+      prisma.passwordResetToken.updateMany({
+        where: { userId: user.id, usedAt: null, id: { not: tokenRecord.id } },
+        data: { usedAt: now }
+      })
+    ]);
+
+    return res.status(200).json({
+      success: true,
+      message: 'Password reset successfully.'
+    });
+  } catch (error) {
+    next(error);
+  }
+};
+
+export const verifyResetToken = async (req: Request, res: Response, next: NextFunction) => {
+  try {
+    const rawToken = (req.query.token as string) || req.body?.token;
+
+    if (!rawToken || typeof rawToken !== 'string' || !rawToken.trim()) {
+      return res.status(400).json({
+        success: false,
+        valid: false,
+        message: 'This password reset link is invalid or has expired.'
+      });
+    }
+
+    const tokenHash = crypto.createHash('sha256').update(rawToken.trim()).digest('hex');
+
+    const tokenRecord = await prisma.passwordResetToken.findUnique({
+      where: { tokenHash },
+      include: { user: true }
+    });
+
+    const now = new Date();
+    if (!tokenRecord || tokenRecord.usedAt !== null || tokenRecord.expiresAt < now) {
+      return res.status(400).json({
+        success: false,
+        valid: false,
+        message: 'This password reset link is invalid or has expired.'
+      });
+    }
+
+    const user = tokenRecord.user;
+    if (!user || (user.role !== 'ADMIN' && user.role !== 'SUPER_ADMIN')) {
+      return res.status(400).json({
+        success: false,
+        valid: false,
+        message: 'This password reset link is invalid or has expired.'
+      });
+    }
+
+    return res.status(200).json({
+      success: true,
+      valid: true,
+      message: 'Password reset link is valid.'
     });
   } catch (error) {
     next(error);
@@ -345,6 +580,43 @@ export const getCustomers = async (req: Request, res: Response, next: NextFuncti
   }
 };
 
+export const getCustomersSummary = async (req: Request, res: Response, next: NextFunction) => {
+  try {
+    const sevenDaysAgo = new Date(Date.now() - 7 * 24 * 60 * 60 * 1000);
+    const thirtyDaysAgo = new Date(Date.now() - 30 * 24 * 60 * 60 * 1000);
+
+    const [totalCustomers, newRegistrations7d, activeCustomers, usedPumpCount] = await Promise.all([
+      prisma.customerProfile.count({
+        where: { isDeleted: false }
+      }),
+      prisma.customerProfile.count({
+        where: { isDeleted: false, joinedAt: { gte: sevenDaysAgo } }
+      }),
+      prisma.customerProfile.count({
+        where: { isDeleted: false, user: { status: 'ACTIVE' } }
+      }),
+      prisma.customerProfile.count({
+        where: {
+          isDeleted: false,
+          transactions: { some: { status: 'COMPLETED', createdAt: { gte: thirtyDaysAgo } } }
+        }
+      })
+    ]);
+
+    res.status(200).json({
+      success: true,
+      data: {
+        totalCustomers,
+        newRegistrations7d,
+        activeCustomers,
+        usedPumpCustomers: usedPumpCount,
+      }
+    });
+  } catch (error) {
+    next(error);
+  }
+};
+
 export const getWorkers = async (req: Request, res: Response, next: NextFunction) => {
   try {
     const page = Math.max(1, parseInt(req.query.page as string) || 1);
@@ -486,6 +758,39 @@ export const getWorkers = async (req: Request, res: Response, next: NextFunction
         limit: isAll ? total : limit,
         total,
         totalPages
+      }
+    });
+  } catch (error) {
+    next(error);
+  }
+};
+
+export const getWorkersSummary = async (req: Request, res: Response, next: NextFunction) => {
+  try {
+    const [totalWorkers, activeWorkers, scansAgg, discountAgg] = await Promise.all([
+      prisma.workerProfile.count({
+        where: { isDeleted: false }
+      }),
+      prisma.workerProfile.count({
+        where: { isDeleted: false, user: { status: 'ACTIVE' } }
+      }),
+      prisma.workerProfile.aggregate({
+        where: { isDeleted: false },
+        _sum: { scans: true }
+      }),
+      prisma.transaction.aggregate({
+        where: { status: 'COMPLETED', worker: { isDeleted: false } },
+        _sum: { discountAmount: true }
+      })
+    ]);
+
+    res.status(200).json({
+      success: true,
+      data: {
+        totalWorkers,
+        activeWorkers,
+        totalScans: scansAgg._sum.scans || 0,
+        discountProcessed: discountAgg._sum.discountAmount || 0,
       }
     });
   } catch (error) {
@@ -788,6 +1093,51 @@ export const getGroups = async (req: Request, res: Response, next: NextFunction)
   }
 };
 
+export const getGroupsSummary = async (req: Request, res: Response, next: NextFunction) => {
+  try {
+    const [totalGroups, activeGroups, totalGroupedCustomers, groupsWithTxns] = await Promise.all([
+      prisma.group.count({ where: { isDeleted: false } }),
+      prisma.group.count({ where: { isDeleted: false, active: true } }),
+      prisma.customerProfile.count({ where: { isDeleted: false, groupId: { not: null } } }),
+      prisma.group.findMany({
+        where: { isDeleted: false },
+        select: {
+          customers: {
+            where: { isDeleted: false },
+            select: {
+              transactions: {
+                where: { status: 'COMPLETED' },
+                select: { discountAmount: true }
+              }
+            }
+          }
+        }
+      })
+    ]);
+
+    let overallDiscountGenerated = 0;
+    for (const g of groupsWithTxns) {
+      for (const c of g.customers) {
+        for (const t of c.transactions) {
+          overallDiscountGenerated += (t.discountAmount || 0);
+        }
+      }
+    }
+
+    res.status(200).json({
+      success: true,
+      data: {
+        totalGroups,
+        activeGroups,
+        groupedCustomers: totalGroupedCustomers,
+        discountGenerated: overallDiscountGenerated,
+      }
+    });
+  } catch (error) {
+    next(error);
+  }
+};
+
 export const getNotifications = async (req: Request, res: Response, next: NextFunction) => {
   try {
     const notifications = await prisma.notification.findMany({
@@ -821,6 +1171,7 @@ export const getProfile = async (req: any, res: Response, next: NextFunction) =>
         role: user.role,
         location: user.adminProfile.location ?? '',
         joinedAt: (user as any).createdAt ?? new Date().toISOString(),
+        profileImage: user.adminProfile.profilePhoto ?? null,
         initials: user.adminProfile.fullName
           .split(' ')
           .map((n: string) => n[0])
@@ -829,6 +1180,204 @@ export const getProfile = async (req: any, res: Response, next: NextFunction) =>
           .slice(0, 2),
       }
     });
+  } catch (error) {
+    next(error);
+  }
+};
+
+export const updateProfile = async (req: any, res: Response, next: NextFunction) => {
+  try {
+    const userId = req.user?.userId;
+    const { name, email, phone, location, profileImage } = req.body;
+
+    const user = await prisma.user.findUnique({
+      where: { id: userId },
+      include: { adminProfile: true }
+    });
+
+    if (!user || !user.adminProfile) {
+      return res.status(404).json({ success: false, message: 'Admin profile not found' });
+    }
+
+    const cleanEmail = email && typeof email === 'string' && email.trim() ? email.trim() : (email === null ? null : undefined);
+    const cleanMobile = phone && typeof phone === 'string' && phone.trim() ? phone.trim() : (phone === null ? null : undefined);
+
+    if (cleanEmail || cleanMobile) {
+      const existing = await prisma.user.findFirst({
+        where: {
+          id: { not: userId },
+          OR: [
+            ...(cleanEmail ? [{ email: cleanEmail }] : []),
+            ...(cleanMobile ? [{ mobile: cleanMobile }] : [])
+          ]
+        }
+      });
+      if (existing) {
+        if (cleanEmail && existing.email === cleanEmail) return res.status(409).json({ success: false, message: 'Email is already in use.' });
+        if (cleanMobile && existing.mobile === cleanMobile) return res.status(409).json({ success: false, message: 'Phone number is already in use.' });
+      }
+    }
+
+    await prisma.user.update({
+      where: { id: userId },
+      data: {
+        email: cleanEmail !== undefined ? cleanEmail : undefined,
+        mobile: cleanMobile !== undefined ? cleanMobile : undefined,
+        adminProfile: {
+          update: {
+            fullName: name !== undefined ? name : undefined,
+            location: location !== undefined ? location : undefined,
+            profilePhoto: profileImage !== undefined ? profileImage : undefined
+          }
+        }
+      }
+    });
+
+    const updatedUser = await prisma.user.findUnique({
+      where: { id: userId },
+      include: { adminProfile: true }
+    });
+
+    res.status(200).json({
+      success: true,
+      message: 'Profile updated successfully',
+      data: {
+        name: updatedUser!.adminProfile!.fullName,
+        email: updatedUser!.email ?? '',
+        phone: updatedUser!.mobile ?? '',
+        role: updatedUser!.role,
+        location: updatedUser!.adminProfile!.location ?? '',
+        joinedAt: (updatedUser as any).createdAt ?? new Date().toISOString(),
+        profileImage: updatedUser!.adminProfile!.profilePhoto ?? null,
+        initials: updatedUser!.adminProfile!.fullName
+          .split(' ')
+          .map((n: string) => n[0])
+          .join('')
+          .toUpperCase()
+          .slice(0, 2),
+      }
+    });
+  } catch (error) {
+    next(error);
+  }
+};
+
+export const changePassword = async (req: any, res: Response, next: NextFunction) => {
+  try {
+    const userId = req.user?.userId;
+    const { currentPassword, newPassword, confirmPassword } = req.body;
+
+    if (!currentPassword || !newPassword || !confirmPassword) {
+      return res.status(400).json({ success: false, message: 'All password fields are required' });
+    }
+
+    if (newPassword !== confirmPassword) {
+      return res.status(400).json({ success: false, message: 'New password and confirm password do not match' });
+    }
+
+    if (newPassword.length < 6) {
+      return res.status(400).json({ success: false, message: 'New password must be at least 6 characters long' });
+    }
+
+    const user = await prisma.user.findUnique({
+      where: { id: userId }
+    });
+
+    if (!user || !user.password) {
+      return res.status(404).json({ success: false, message: 'Admin not found' });
+    }
+
+    const isMatch = await bcrypt.compare(currentPassword, user.password);
+    if (!isMatch) {
+      return res.status(401).json({ success: false, message: 'Invalid current password' });
+    }
+
+    const hashedPassword = await bcrypt.hash(newPassword, 10);
+
+    await prisma.user.update({
+      where: { id: userId },
+      data: { password: hashedPassword }
+    });
+
+    res.status(200).json({
+      success: true,
+      message: 'Password changed successfully'
+    });
+  } catch (error) {
+    next(error);
+  }
+};
+
+export const uploadProfileImage = async (req: any, res: Response, next: NextFunction) => {
+  try {
+    const userId = req.user?.userId;
+    if (!req.file) {
+      return res.status(400).json({ success: false, message: 'No file uploaded' });
+    }
+
+    // construct URL for the uploaded file
+    const fileUrl = `${req.protocol}://${req.get('host')}/uploads/${req.file.filename}`;
+
+    await prisma.user.update({
+      where: { id: userId },
+      data: {
+        adminProfile: {
+          update: {
+            profilePhoto: fileUrl
+          }
+        }
+      }
+    });
+
+    res.status(200).json({
+      success: true,
+      message: 'Profile image uploaded successfully',
+      data: {
+        profileImage: fileUrl
+      }
+    });
+  } catch (error) {
+    next(error);
+  }
+};
+
+export const globalSearch = async (req: Request, res: Response, next: NextFunction) => {
+  try {
+    const q = req.query.q as string;
+    if (!q || q.length < 2) {
+      return res.status(200).json({ success: true, data: [] });
+    }
+
+    const searchTerm = q.trim();
+
+    // Customers
+    const customers = await prisma.customerProfile.findMany({
+      where: { fullName: { contains: searchTerm, mode: 'insensitive' }, isDeleted: false },
+      select: { id: true, fullName: true },
+      take: 5
+    });
+
+    // Workers
+    const workers = await prisma.workerProfile.findMany({
+      where: { fullName: { contains: searchTerm, mode: 'insensitive' }, isDeleted: false },
+      select: { id: true, fullName: true },
+      take: 5
+    });
+
+    // Groups
+    const groups = await prisma.group.findMany({
+      where: { name: { contains: searchTerm, mode: 'insensitive' }, isDeleted: false },
+      select: { id: true, name: true },
+      take: 5
+    });
+
+    const results = [
+      ...customers.map(c => ({ type: 'customer', id: c.id, name: c.fullName })),
+      ...workers.map(w => ({ type: 'worker', id: w.id, name: w.fullName })),
+      ...groups.map(g => ({ type: 'group', id: g.id, name: g.name }))
+    ];
+
+    res.status(200).json({ success: true, data: results });
   } catch (error) {
     next(error);
   }

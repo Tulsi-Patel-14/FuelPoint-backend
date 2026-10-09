@@ -8,7 +8,214 @@ const swaggerDocument = {
     version: '1.0.0',
     description: 'API documentation for Customer, Worker, and Admin clients.'
   },
-  paths: {}
+  components: {
+    securitySchemes: {
+      bearerAuth: {
+        type: 'http',
+        scheme: 'bearer',
+        bearerFormat: 'JWT'
+      }
+    }
+  },
+  paths: {
+    '/api/v1/admin/auth/forgot-password': {
+      post: {
+        summary: 'Request password reset link',
+        tags: ['Admin Auth'],
+        requestBody: {
+          required: true,
+          content: {
+            'application/json': {
+              schema: {
+                type: 'object',
+                required: ['email'],
+                properties: {
+                  email: {
+                    type: 'string',
+                    format: 'email',
+                    example: 'admin@fuelpoint.in'
+                  }
+                }
+              }
+            }
+          }
+        },
+        responses: {
+          200: {
+            description: 'Reset request received (generic message to prevent email enumeration)',
+            content: {
+              'application/json': {
+                schema: {
+                  type: 'object',
+                  properties: {
+                    message: {
+                      type: 'string',
+                      example: 'If an account exists for this email, a password reset link has been sent.'
+                    }
+                  }
+                }
+              }
+            }
+          },
+          400: { description: 'Invalid input' },
+          429: { description: 'Too many reset requests' }
+        }
+      }
+    },
+    '/api/v1/admin/auth/reset-password': {
+      post: {
+        summary: 'Reset password with secure token',
+        tags: ['Admin Auth'],
+        requestBody: {
+          required: true,
+          content: {
+            'application/json': {
+              schema: {
+                type: 'object',
+                required: ['token', 'password'],
+                properties: {
+                  token: {
+                    type: 'string',
+                    example: 'e83a7f9...'
+                  },
+                  password: {
+                    type: 'string',
+                    minLength: 8,
+                    example: 'NewSecurePassword123!'
+                  },
+                  confirmPassword: {
+                    type: 'string',
+                    example: 'NewSecurePassword123!'
+                  }
+                }
+              }
+            }
+          }
+        },
+        responses: {
+          200: {
+            description: 'Password reset successfully',
+            content: {
+              'application/json': {
+                schema: {
+                  type: 'object',
+                  properties: {
+                    message: {
+                      type: 'string',
+                      example: 'Password reset successfully.'
+                    }
+                  }
+                }
+              }
+            }
+          },
+          400: { description: 'Invalid or expired token, or invalid password' }
+        }
+      }
+    },
+    '/api/v1/admin/profile': {
+      get: {
+        summary: 'Get Admin Profile',
+        tags: ['Admin Profile'],
+        security: [{ bearerAuth: [] }],
+        responses: {
+          '200': { description: 'Successful response' },
+          '404': { description: 'Admin profile not found' }
+        }
+      },
+      put: {
+        summary: 'Update Admin Profile',
+        tags: ['Admin Profile'],
+        security: [{ bearerAuth: [] }],
+        requestBody: {
+          content: {
+            'application/json': {
+              schema: {
+                type: 'object',
+                properties: {
+                  name: { type: 'string' },
+                  email: { type: 'string' },
+                  phone: { type: 'string' },
+                  location: { type: 'string' },
+                  profileImage: { type: 'string' }
+                }
+              }
+            }
+          }
+        },
+        responses: {
+          '200': { description: 'Profile updated successfully' },
+          '400': { description: 'Bad request' },
+          '409': { description: 'Conflict (Email or Phone already exists)' }
+        }
+      }
+    },
+    '/api/v1/admin/profile/password': {
+      patch: {
+        summary: 'Change Admin Password',
+        tags: ['Admin Profile'],
+        security: [{ bearerAuth: [] }],
+        requestBody: {
+          required: true,
+          content: {
+            'application/json': {
+              schema: {
+                type: 'object',
+                required: ['currentPassword', 'newPassword', 'confirmPassword'],
+                properties: {
+                  currentPassword: { type: 'string' },
+                  newPassword: { type: 'string' },
+                  confirmPassword: { type: 'string' }
+                }
+              }
+            }
+          }
+        },
+        responses: {
+          '200': { description: 'Password changed successfully' },
+          '400': { description: 'Invalid input' },
+          '401': { description: 'Invalid current password' }
+        }
+      }
+    },
+    '/api/v1/admin/auth/verify-reset-token': {
+      get: {
+        summary: 'Verify whether a password reset token is valid and unused',
+        tags: ['Admin Auth'],
+        parameters: [
+          {
+            name: 'token',
+            in: 'query',
+            required: true,
+            schema: {
+              type: 'string',
+              example: 'e83a7f9...'
+            }
+          }
+        ],
+        responses: {
+          200: {
+            description: 'Token is valid and active',
+            content: {
+              'application/json': {
+                schema: {
+                  type: 'object',
+                  properties: {
+                    success: { type: 'boolean', example: true },
+                    valid: { type: 'boolean', example: true },
+                    message: { type: 'string', example: 'Password reset link is valid.' }
+                  }
+                }
+              }
+            }
+          },
+          400: {
+            description: 'Token is invalid, expired, or already used'
+          }
+        }
+      }
+    }
+  }
 };
 
 export const setupSwagger = (app: Express) => {
