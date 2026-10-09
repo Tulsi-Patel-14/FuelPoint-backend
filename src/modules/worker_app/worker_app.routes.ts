@@ -11,7 +11,8 @@ import {
   getYearlySummary,
   getTransactions,
   getDashboardData,
-  getTransactionById
+  getTransactionById,
+  getCustomerDetails
 } from './worker_app.controller';
 import { authMiddleware } from '../../middlewares/auth.middleware';
 import { roleMiddleware } from '../../middlewares/role.middleware';
@@ -43,6 +44,10 @@ router.post('/qr/scan', scanCustomerQR);
 // Verify Customer OTP
 router.post('/qr/verify-otp', verifyCustomerOtp);
 
+// Customer Verification Data Endpoint
+router.get('/customer/:id', getCustomerDetails);
+router.get('/customer/details/:id', getCustomerDetails);
+
 // 4. Submit Fuel Transaction
 router.post('/transactions/submit', submitTransaction);
 
@@ -62,7 +67,7 @@ router.get('/transactions/details/:id', getTransactionById);
 // 9. Unified Dashboard
 router.get('/transactions/dashboard', getDashboardData);
 
-// 9. Get Profile
+// 10. Get Profile
 router.get('/profile', getWorkerProfile);
 
 export default router;
