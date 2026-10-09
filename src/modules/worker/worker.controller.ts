@@ -1,9 +1,11 @@
+import prisma from '../../utils/prisma';
 import { Request, Response, NextFunction } from 'express';
-import { PrismaClient } from '@prisma/client';
+
 import { generateTokens } from '../../utils/jwt';
 import bcrypt from 'bcrypt';
+import { generateNextTransactionId } from '../../utils/idGenerator';
 
-const prisma = new PrismaClient();
+
 
 export const login = async (req: Request, res: Response, next: NextFunction) => {
   try {
@@ -134,9 +136,11 @@ export const redeemTransaction = async (req: Request, res: Response, next: NextF
     const finalAmount = fuelAmount - discountAmount;
     const litres = fuelAmount / 100;
 
+    const customId = await generateNextTransactionId(prisma);
     const transaction = await prisma.$transaction(async (tx) => {
       const newTx = await tx.transaction.create({
         data: {
+          customId,
           customerId: customer.id,
           workerId: worker.id,
           stationId: petrolPumpId || worker.stationId || 'default-station',
@@ -147,7 +151,7 @@ export const redeemTransaction = async (req: Request, res: Response, next: NextF
           finalAmount,
           litres,
           idempotencyKey
-        }
+        } as any
       });
 
       await tx.qRSession.update({
@@ -155,7 +159,14 @@ export const redeemTransaction = async (req: Request, res: Response, next: NextF
         data: { status: 'COMPLETED', consumedAt: new Date() }
       });
 
-      return newTx;
+      const txCustomId = (newTx as any).customId || customId;
+
+      return {
+        ...newTx,
+        customId: txCustomId,
+        displayId: txCustomId,
+        transactionCode: txCustomId
+      };
     });
 
     res.status(200).json({
@@ -186,13 +197,54 @@ export const getTransactions = async (req: Request, res: Response, next: NextFun
     const worker = await prisma.workerProfile.findUnique({ where: { userId } });
     if (!worker) return res.status(404).json({ success: false, message: 'Worker not found' });
 
+    const search = ((req.query.search || req.query.query || req.query.searchQuery || '') as string).trim();
+    const filterType = (req.query.filterType as string || 'ALL').toUpperCase();
+    const limit = parseInt(req.query.limit as string) || 50;
+
+    let whereClause: any = { workerId: worker.id };
+
+    if (filterType === 'TODAY') {
+      let startDate = new Date();
+      startDate.setHours(0, 0, 0, 0);
+      whereClause.createdAt = { gte: startDate };
+    } else if (filterType === 'THIS_MONTH') {
+      let startDate = new Date();
+      startDate = new Date(startDate.getFullYear(), startDate.getMonth(), 1);
+      whereClause.createdAt = { gte: startDate };
+    }
+
+    // Only filter if search query has at least 2 characters to prevent single-char API hits
+    if (search && search.length >= 2) {
+      whereClause.OR = [
+        { id: { contains: search, mode: 'insensitive' } },
+        { customId: { contains: search, mode: 'insensitive' } },
+        { customer: { fullName: { contains: search, mode: 'insensitive' } } },
+        { customer: { customId: { contains: search, mode: 'insensitive' } } }
+      ];
+    }
+
     const transactions = await prisma.transaction.findMany({
-      where: { workerId: worker.id },
+      where: whereClause,
       orderBy: { createdAt: 'desc' },
-      take: 50,
+      take: limit,
       include: { customer: true }
     });
-    res.status(200).json({ success: true, data: transactions });
+
+    const formatted = transactions.map(tx => {
+      const txCustomId = (tx as any).customId || tx.id;
+      const custCustomId = (tx.customer as any)?.customId || tx.customerId;
+      return {
+        ...tx,
+        customId: txCustomId,
+        displayId: txCustomId,
+        transactionId: txCustomId,
+        transactionCode: txCustomId,
+        customerId: custCustomId,
+        customerCode: custCustomId
+      };
+    });
+
+    res.status(200).json({ success: true, data: formatted });
   } catch (error) {
     next(error);
   }

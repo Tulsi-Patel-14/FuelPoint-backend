@@ -1,9 +1,22 @@
+import prisma from '../../utils/prisma';
 import { Request, Response, NextFunction } from 'express';
-import { PrismaClient } from '@prisma/client';
+
 import { generateTokens } from '../../utils/jwt';
 import crypto from 'crypto';
+import { generateNextCustomerId, formatCustomerId } from '../../utils/idGenerator';
 
-const prisma = new PrismaClient();
+
+
+const formatCustomerProfile = (profile: any) => {
+  if (!profile) return profile;
+  const customId = profile.customId || formatCustomerId(1);
+  return {
+    ...profile,
+    customId,
+    displayId: customId,
+    customerCode: customId
+  };
+};
 
 export const login = async (req: Request, res: Response, next: NextFunction) => {
   try {
@@ -20,12 +33,14 @@ export const login = async (req: Request, res: Response, next: NextFunction) => 
 
     if (!user) {
       const defaultGroup = await prisma.group.findFirst({ where: { isDefault: true, isDeleted: false } });
+      const customId = await generateNextCustomerId(prisma);
       user = await prisma.user.create({
         data: {
           mobile,
           role: 'CUSTOMER',
           customerProfile: {
             create: {
+              customId,
               fullName: 'New Customer',
               groupId: defaultGroup?.id
             }
@@ -35,6 +50,7 @@ export const login = async (req: Request, res: Response, next: NextFunction) => 
       });
     }
 
+    if (!user) return res.status(500).json({ success: false, message: 'User not found' });
     const { accessToken, refreshToken } = generateTokens(user.id, user.role);
 
     res.status(200).json({
@@ -43,7 +59,7 @@ export const login = async (req: Request, res: Response, next: NextFunction) => 
       data: {
         token: accessToken,
         refreshToken,
-        customer: user.customerProfile
+        customer: formatCustomerProfile(user.customerProfile)
       }
     });
   } catch (error) {

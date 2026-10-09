@@ -1,11 +1,13 @@
+import prisma from '../../utils/prisma';
 import { Request, Response, NextFunction } from 'express';
-import { PrismaClient } from '@prisma/client';
+
 import { generateTokens } from '../../utils/jwt';
 import bcrypt from 'bcrypt';
+import { generateNextWorkerId, generateNextCustomerId } from '../../utils/idGenerator';
+
 import crypto from 'crypto';
 import { sendPasswordResetEmail } from '../../utils/email';
 
-const prisma = new PrismaClient();
 
 // In-memory rate limiting map for forgot password requests (max 5 requests per 15 mins per IP/email)
 const resetRateLimitMap = new Map<string, { count: number; firstRequest: number }>();
@@ -836,6 +838,8 @@ export const createWorker = async (req: Request, res: Response, next: NextFuncti
       stationConnect = { connect: { id: stationId.trim() } };
     }
 
+    const customId = await generateNextWorkerId(prisma, workerFullName);
+
     const user = await prisma.user.create({
       data: {
         email: cleanEmail,
@@ -845,10 +849,11 @@ export const createWorker = async (req: Request, res: Response, next: NextFuncti
         status: status ? status.toUpperCase() : 'ACTIVE',
         workerProfile: {
           create: {
+            customId,
             fullName: workerFullName,
             shift: shift || 'Morning',
             ...(stationConnect && { station: stationConnect })
-          }
+          } as any
         }
       },
       include: {
@@ -1412,16 +1417,19 @@ export const createCustomer = async (req: Request, res: Response, next: NextFunc
         groupConnect = { connect: { id: groupId.trim() } };
       }
 
+      const customId = await generateNextCustomerId(prisma);
+
       const user = await prisma.user.create({
         data: {
           email: cleanEmail, mobile: cleanMobile, password: hashedPassword, role: 'CUSTOMER', status: userStatus as any,
           customerProfile: {
             create: {
+              customId,
               fullName: customerFullName,
               vehicle: vehicle !== undefined ? vehicle : undefined,
               address: address !== undefined ? address : undefined,
               ...(groupConnect && { group: groupConnect })
-            }
+            } as any
           }
         },
         include: { customerProfile: { include: { group: true, user: true } } }
