@@ -50,6 +50,7 @@ model User {
   adminProfile    AdminProfile?
 
   notifications Notification[]
+  passwordResetTokens PasswordResetToken[]
 }
 
 model Group {
@@ -104,8 +105,9 @@ model AdminProfile {
   id        String   @id @default(uuid())
   userId    String   @unique
   user      User     @relation(fields: [userId], references: [id])
-  fullName  String
-  location  String?
+  fullName     String
+  location     String?
+  profilePhoto String?
 }
 
 model Station {
@@ -165,5 +167,19 @@ model Notification {
   message   String
   read      Boolean  @default(false)
   createdAt DateTime @default(now())
+}
+
+model PasswordResetToken {
+  id        String    @id @default(uuid())
+  userId    String
+  user      User      @relation(fields: [userId], references: [id], onDelete: Cascade)
+  tokenHash String    @unique
+  expiresAt DateTime
+  usedAt    DateTime?
+  createdAt DateTime  @default(now())
+
+  @@index([userId])
+  @@index([tokenHash])
+  @@index([expiresAt])
 }
 
