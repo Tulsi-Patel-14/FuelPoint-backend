@@ -471,6 +471,11 @@ export const submitTransaction = async (req: Request, res: Response, next: NextF
         });
       }
 
+      await tx.workerProfile.update({
+        where: { id: worker.id },
+        data: { scans: { increment: 1 } }
+      });
+
       return newTx;
     });
 

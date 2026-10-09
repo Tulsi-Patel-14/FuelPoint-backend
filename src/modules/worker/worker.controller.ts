@@ -159,6 +159,11 @@ export const redeemTransaction = async (req: Request, res: Response, next: NextF
         data: { status: 'COMPLETED', consumedAt: new Date() }
       });
 
+      await tx.workerProfile.update({
+        where: { id: worker.id },
+        data: { scans: { increment: 1 } }
+      });
+
       const txCustomId = (newTx as any).customId || customId;
 
       return {
