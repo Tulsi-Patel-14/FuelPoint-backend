@@ -12,7 +12,10 @@ import {
   getMonthlySummary,
   getYearlySummary,
   getTransactions,
-  getTransactionById
+  getTransactionById,
+  getNotifications,
+  markNotificationRead,
+  markAllNotificationsRead
 } from './customer_app.controller';
 import { authMiddleware } from '../../middlewares/auth.middleware';
 import { roleMiddleware } from '../../middlewares/role.middleware';
@@ -46,5 +49,10 @@ router.get('/transactions/yearly-summary', getYearlySummary);
 // 5. General Transactions
 router.get('/transactions', getTransactions); // e.g. ?filterType=ALL
 router.get('/transactions/:id', getTransactionById);
+
+// 6. Notifications
+router.get('/notifications', getNotifications);
+router.patch('/notifications/:id/read', markNotificationRead);
+router.post('/notifications/mark-all-read', markAllNotificationsRead);
 
 export default router;

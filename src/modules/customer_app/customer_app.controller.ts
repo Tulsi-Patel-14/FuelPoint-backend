@@ -54,6 +54,15 @@ export const register = async (req: Request, res: Response, next: NextFunction) 
       include: { customerProfile: true }
     });
 
+    // Create admin notification
+    await prisma.notification.create({
+      data: {
+        type: 'registration',
+        title: 'New Customer Registered',
+        message: `${fullName} (${mobile}) has registered on the app.`
+      }
+    });
+
     // Generate tokens for auto-login after registration
     const { accessToken, refreshToken } = generateTokens(user.id, user.role);
 
@@ -604,6 +613,65 @@ export const getTransactionById = async (req: Request, res: Response, next: Next
     });
   } catch (error) {
     console.error('[getTransactionById] Error:', error);
+    next(error);
+  }
+};
+
+// 6. Notifications
+export const getNotifications = async (req: any, res: Response, next: NextFunction) => {
+  try {
+    const userId = req.user?.userId;
+    if (!userId) return res.status(401).json({ success: false, message: 'Unauthorized' });
+
+    const notifications = await prisma.notification.findMany({
+      where: { userId },
+      orderBy: { createdAt: 'desc' },
+      take: 50
+    });
+
+    res.status(200).json({ success: true, data: notifications });
+  } catch (error) {
+    console.error('[getNotifications] Error:', error);
+    next(error);
+  }
+};
+
+export const markNotificationRead = async (req: any, res: Response, next: NextFunction) => {
+  try {
+    const userId = req.user?.userId;
+    const { id } = req.params;
+
+    if (!userId) return res.status(401).json({ success: false, message: 'Unauthorized' });
+
+    const notif = await prisma.notification.findUnique({ where: { id } });
+    if (!notif) return res.status(404).json({ success: false, message: 'Notification not found' });
+    if (notif.userId !== userId) return res.status(403).json({ success: false, message: 'Forbidden' });
+
+    const updated = await prisma.notification.update({
+      where: { id },
+      data: { read: true }
+    });
+
+    res.status(200).json({ success: true, data: updated });
+  } catch (error) {
+    console.error('[markNotificationRead] Error:', error);
+    next(error);
+  }
+};
+
+export const markAllNotificationsRead = async (req: any, res: Response, next: NextFunction) => {
+  try {
+    const userId = req.user?.userId;
+    if (!userId) return res.status(401).json({ success: false, message: 'Unauthorized' });
+
+    await prisma.notification.updateMany({
+      where: { userId, read: false },
+      data: { read: true }
+    });
+
+    res.status(200).json({ success: true, message: 'All notifications marked as read' });
+  } catch (error) {
+    console.error('[markAllNotificationsRead] Error:', error);
     next(error);
   }
 };

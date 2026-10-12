@@ -1142,7 +1142,7 @@ export const getNotifications = async (req: Request, res: Response, next: NextFu
   try {
     const notifications = await prisma.notification.findMany({
       orderBy: { createdAt: 'desc' },
-      take: 20
+      take: 50 // Increased to 50 so history is preserved
     });
     res.status(200).json({ success: true, data: notifications });
   } catch (error) {
