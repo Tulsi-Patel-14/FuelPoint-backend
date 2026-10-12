@@ -4,6 +4,7 @@ import { Request, Response, NextFunction } from 'express';
 import { generateTokens } from '../../utils/jwt';
 import crypto from 'crypto';
 import { generateNextCustomerId, formatCustomerId } from '../../utils/idGenerator';
+import { checkStationGeofence } from '../../utils/geofence';
 
 
 
@@ -111,11 +112,44 @@ export const getProfile = async (req: Request, res: Response, next: NextFunction
 export const generateQR = async (req: Request, res: Response, next: NextFunction) => {
   try {
     const userId = (req as any).user.userId;
-    const { stationId } = req.body;
+    const { stationId, latitude, longitude, lat, lng } = req.body;
 
     const profile = await prisma.customerProfile.findUnique({ where: { userId } });
     if (!profile) return res.status(404).json({ success: false, message: 'Profile not found' });
 
+    // 1. Resolve Fuel Station
+    let station = null;
+    if (stationId) {
+      station = await prisma.station.findUnique({ where: { id: stationId } });
+    }
+    if (!station) {
+      station = await prisma.station.findFirst({ where: { active: true } });
+    }
+
+    if (!station) {
+      return res.status(404).json({ success: false, message: 'Fuel station not found' });
+    }
+
+    // 2. Validate location and check station geofence radius
+    const userLat = Number(latitude ?? lat);
+    const userLng = Number(longitude ?? lng);
+    const radiusMeters = station.radiusMeters || 150;
+    const isInvalidCoords = isNaN(userLat) || isNaN(userLng) || (userLat === 0 && userLng === 0);
+
+    const geofence = !isInvalidCoords
+      ? checkStationGeofence(userLat, userLng, station.latitude, station.longitude, radiusMeters)
+      : { isInside: false, distanceMeters: 0 };
+
+    if (!geofence.isInside) {
+      return res.status(400).json({
+        success: false,
+        message: 'You are not at the petrol pump premises!',
+        distanceMeters: geofence.distanceMeters,
+        radiusMeters
+      });
+    }
+
+    // 4. Generate QR code if within premises
     const token = crypto.randomBytes(16).toString('hex');
     const expiresAt = new Date(Date.now() + 60 * 1000);
 
@@ -123,7 +157,7 @@ export const generateQR = async (req: Request, res: Response, next: NextFunction
       data: {
         token,
         customerId: profile.id,
-        stationId,
+        stationId: station.id,
         expiresAt,
         status: 'ACTIVE'
       }
@@ -134,7 +168,8 @@ export const generateQR = async (req: Request, res: Response, next: NextFunction
       data: {
         token: qrSession.token,
         qrValue: `fuel://customer/${qrSession.token}`,
-        expiresAt: qrSession.expiresAt.getTime()
+        expiresAt: qrSession.expiresAt.getTime(),
+        expiresIn: 60
       }
     });
   } catch (error) {
