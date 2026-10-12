@@ -1668,10 +1668,13 @@ export const markNotificationRead = async (req: any, res: Response, next: NextFu
   try {
     const id = req.params.id as string;
     const userId = req.user?.userId;
-    // ensure notification belongs to user or is global
+    const isAdmin = req.user?.role === 'ADMIN' || req.user?.role === 'SUPER_ADMIN';
+
     const notif = await prisma.notification.findUnique({ where: { id } });
     if (!notif) return res.status(404).json({ success: false, message: 'Notification not found' });
-    if (notif.userId && notif.userId !== userId) return res.status(403).json({ success: false, message: 'Unauthorized' });
+    if (!isAdmin && notif.userId && notif.userId !== userId) {
+      return res.status(403).json({ success: false, message: 'Unauthorized' });
+    }
 
     const updated = await prisma.notification.update({ where: { id }, data: { read: true } });
     res.status(200).json({ success: true, data: updated });
@@ -1681,9 +1684,10 @@ export const markNotificationRead = async (req: any, res: Response, next: NextFu
 export const markAllNotificationsRead = async (req: any, res: Response, next: NextFunction) => {
   try {
     const userId = req.user?.userId;
-    // update all for this user, OR global if allowed, but safest is to scope to user
+    const isAdmin = req.user?.role === 'ADMIN' || req.user?.role === 'SUPER_ADMIN';
+
     await prisma.notification.updateMany({ 
-      where: { OR: [{ userId }, { userId: null }] }, 
+      where: isAdmin ? { read: false } : { OR: [{ userId }, { userId: null }], read: false }, 
       data: { read: true } 
     });
     res.status(200).json({ success: true, message: 'All notifications marked as read' });

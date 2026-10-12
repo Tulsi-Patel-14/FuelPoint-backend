@@ -84,6 +84,7 @@ router.delete('/groups/:id', deleteGroup);
 // Notifications
 router.get('/notifications', getNotifications);
 router.patch('/notifications/:id/read', markNotificationRead);
+router.put('/notifications/:id/read', markNotificationRead);
 router.post('/notifications/mark-all-read', markAllNotificationsRead);
 
 // Stations
