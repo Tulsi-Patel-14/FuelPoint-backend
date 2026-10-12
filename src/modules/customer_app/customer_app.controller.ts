@@ -1,12 +1,49 @@
+import prisma from '../../utils/prisma';
 import { Request, Response, NextFunction } from 'express';
-import { PrismaClient } from '@prisma/client';
 import { generateTokens } from '../../utils/jwt';
 import crypto from 'crypto';
+import { generateNextCustomerId, formatCustomerId, formatTransactionId } from '../../utils/idGenerator';
+import { checkStationGeofence } from '../../utils/geofence';
 
-const prisma = new PrismaClient();
 
 // In-memory store for OTPs (For production, consider using Redis)
 const otpStore = new Map<string, { otp: string; expiresAt: number }>();
+
+// Helper to format customer profile with custom display ID (cust001)
+const formatCustomerProfile = (profile: any) => {
+  if (!profile) return profile;
+  const customId = profile.customId || formatCustomerId(1);
+  return {
+    ...profile,
+    customId,
+    displayId: customId,
+    customerId: customId,
+    customerCode: customId
+  };
+};
+
+// Helper to format transactions: exclude fuel qty (litres) and include customId (TXN00001), discount fields, fuelTotal & groupName
+const formatTransactions = (txs: any[], defaultGroupName?: string) =>
+  txs.map(({ litres, customer, worker, ...tx }, idx) => {
+    const customId = tx.customId || formatTransactionId(txs.length - idx);
+    const customerCustomId = customer?.customId || formatCustomerId(1);
+    const workerCustomId = worker?.customId || 'Nayra001';
+    return {
+      ...tx,
+      customId,
+      displayId: customId,
+      transactionId: customId,
+      transactionCode: customId,
+      customerId: customerCustomId,
+      workerId: workerCustomId,
+      workerName: worker?.fullName || tx.workerName || 'Nayra Singh',
+      groupName: customer?.group?.name || defaultGroupName || 'Standard Group',
+      discountPercent: tx.discountPercent || 0,
+      discountPercentage: tx.discountPercent || 0,
+      fuelTotal: tx.amount,
+      originalAmount: tx.amount
+    };
+  });
 
 // 0. Register Customer
 export const register = async (req: Request, res: Response, next: NextFunction) => {
@@ -36,6 +73,8 @@ export const register = async (req: Request, res: Response, next: NextFunction) 
       where: { isDefault: true, isDeleted: false }
     });
 
+    const customId = await generateNextCustomerId(prisma);
+
     // Create User and CustomerProfile
     const user = await prisma.user.create({
       data: {
@@ -45,10 +84,11 @@ export const register = async (req: Request, res: Response, next: NextFunction) 
         status: 'ACTIVE',
         customerProfile: {
           create: {
+            customId,
             fullName,
             vehicle: vehicle || null,
             groupId: defaultGroup?.id
-          }
+          } as any
         }
       },
       include: { customerProfile: true }
@@ -73,7 +113,7 @@ export const register = async (req: Request, res: Response, next: NextFunction) 
         token: accessToken,
         refreshToken,
         customer: {
-          ...user.customerProfile,
+          ...formatCustomerProfile((user as any).customerProfile),
           mobile: user.mobile,
           email: user.email
         }
@@ -189,7 +229,7 @@ export const verifyOtpAndLogin = async (req: Request, res: Response, next: NextF
         token: accessToken,
         refreshToken,
         customer: {
-          ...user.customerProfile,
+          ...formatCustomerProfile(user.customerProfile),
           mobile: user.mobile,
           email: user.email
         }
@@ -210,6 +250,7 @@ export const getProfile = async (req: Request, res: Response, next: NextFunction
       include: {
         customerProfile: {
           include: {
+            group: true,
             transactions: {
               where: { status: 'COMPLETED' },
               orderBy: { createdAt: 'desc' }
@@ -234,18 +275,21 @@ export const getProfile = async (req: Request, res: Response, next: NextFunction
     // Helper to calculate stats from an array of transactions
     const calcStats = (txs: any[]) => ({
       visits: txs.length,
-      fuelLiters: txs.reduce((acc, tx) => acc + tx.litres, 0),
-      spent: txs.reduce((acc, tx) => acc + tx.finalAmount, 0)
+      spent: txs.reduce((acc, tx) => acc + tx.finalAmount, 0),
+      discountPercent: txs.length > 0 ? Math.round((txs.reduce((acc, tx) => acc + (tx.discountPercent || 0), 0) / txs.length) * 100) / 100 : 0
     });
 
     const todayTxs = profile.transactions.filter(t => new Date(t.createdAt) >= today);
     const monthTxs = profile.transactions.filter(t => new Date(t.createdAt) >= startOfMonth);
     const yearTxs = profile.transactions.filter(t => new Date(t.createdAt) >= startOfYear);
 
+    const cleanTransactions = formatTransactions(profile.transactions, profile.group?.name);
+
     res.status(200).json({
       success: true,
       data: {
-        ...profile,
+        ...formatCustomerProfile(profile),
+        transactions: cleanTransactions,
         mobile: user.mobile,
         email: user.email,
         stats: {
@@ -265,11 +309,44 @@ export const getProfile = async (req: Request, res: Response, next: NextFunction
 export const generateQR = async (req: Request, res: Response, next: NextFunction) => {
   try {
     const userId = (req as any).user.userId;
-    const { stationId } = req.body;
+    const { stationId, latitude, longitude, lat, lng } = req.body;
 
     const profile = await prisma.customerProfile.findUnique({ where: { userId } });
     if (!profile) return res.status(404).json({ success: false, message: 'Profile not found' });
 
+    // 1. Resolve Fuel Station
+    let station = null;
+    if (stationId) {
+      station = await prisma.station.findUnique({ where: { id: stationId } });
+    }
+    if (!station) {
+      station = await prisma.station.findFirst({ where: { active: true } });
+    }
+
+    if (!station) {
+      return res.status(404).json({ success: false, message: 'Fuel station not found' });
+    }
+
+    // 2. Validate location and check station geofence radius
+    const userLat = Number(latitude ?? lat);
+    const userLng = Number(longitude ?? lng);
+    const radiusMeters = station.radiusMeters || 150;
+    const isInvalidCoords = isNaN(userLat) || isNaN(userLng) || (userLat === 0 && userLng === 0);
+
+    const geofence = !isInvalidCoords
+      ? checkStationGeofence(userLat, userLng, station.latitude, station.longitude, radiusMeters)
+      : { isInside: false, distanceMeters: 0 };
+
+    if (!geofence.isInside) {
+      return res.status(400).json({
+        success: false,
+        message: 'You are not at the petrol pump premises!',
+        distanceMeters: geofence.distanceMeters,
+        radiusMeters
+      });
+    }
+
+    // 4. Generate QR code if within premises
     const token = crypto.randomBytes(16).toString('hex');
     const expiresAt = new Date(Date.now() + 60 * 1000);
 
@@ -277,7 +354,7 @@ export const generateQR = async (req: Request, res: Response, next: NextFunction
       data: {
         token,
         customerId: profile.id,
-        stationId,
+        stationId: station.id,
         expiresAt,
         status: 'ACTIVE'
       }
@@ -346,7 +423,7 @@ export const getStations = async (req: Request, res: Response, next: NextFunctio
 export const getDashboardData = async (req: Request, res: Response, next: NextFunction) => {
   try {
     const userId = (req as any).user.userId;
-    const profile = await prisma.customerProfile.findUnique({ where: { userId } });
+    const profile = await prisma.customerProfile.findUnique({ where: { userId }, include: { group: true } });
     if (!profile) return res.status(404).json({ success: false, message: 'Profile not found.' });
 
     const period = req.query.period as string || 'today';
@@ -382,17 +459,23 @@ export const getDashboardData = async (req: Request, res: Response, next: NextFu
       include: { station: true, worker: { select: { fullName: true } } }
     });
 
+
+
+    const avgDiscount = transactions.length > 0
+      ? Math.round((transactions.reduce((acc, tx) => acc + (tx.discountPercent || 0), 0) / transactions.length) * 100) / 100
+      : 0;
+
     res.status(200).json({
       success: true,
       data: {
         summary: {
           transactionCount: stats._count.id,
-          totalLitres: stats._sum.litres || 0,
-          totalFuelAmount: stats._sum.amount || 0,
+          totalSpent: stats._sum.finalAmount || 0,
           totalDiscountAmount: stats._sum.discountAmount || 0,
+          discountPercent: avgDiscount,
           totalFinalAmount: stats._sum.finalAmount || 0
         },
-        transactions
+        transactions: formatTransactions(transactions, profile?.group?.name)
       }
     });
   } catch (error) {
@@ -404,7 +487,7 @@ export const getDashboardData = async (req: Request, res: Response, next: NextFu
 export const getTodayTransactions = async (req: Request, res: Response, next: NextFunction) => {
   try {
     const userId = (req as any).user.userId;
-    const profile = await prisma.customerProfile.findUnique({ where: { userId } });
+    const profile = await prisma.customerProfile.findUnique({ where: { userId }, include: { group: true } });
     if (!profile) return res.status(404).json({ success: false, message: 'Profile not found.' });
 
     const today = new Date();
@@ -430,17 +513,21 @@ export const getTodayTransactions = async (req: Request, res: Response, next: Ne
       include: { station: true, worker: { select: { fullName: true } } }
     });
 
+    const avgDiscount = transactions.length > 0
+      ? Math.round((transactions.reduce((acc, tx) => acc + (tx.discountPercent || 0), 0) / transactions.length) * 100) / 100
+      : 0;
+
     res.status(200).json({
       success: true,
       data: {
         summary: {
           transactionCount: stats._count.id,
-          totalLitres: stats._sum.litres || 0,
-          totalFuelAmount: stats._sum.amount || 0,
+          totalSpent: stats._sum.finalAmount || 0,
           totalDiscountAmount: stats._sum.discountAmount || 0,
+          discountPercent: avgDiscount,
           totalFinalAmount: stats._sum.finalAmount || 0
         },
-        transactions
+        transactions: formatTransactions(transactions, profile?.group?.name)
       }
     });
   } catch (error) {
@@ -452,7 +539,7 @@ export const getTodayTransactions = async (req: Request, res: Response, next: Ne
 export const getMonthlySummary = async (req: Request, res: Response, next: NextFunction) => {
   try {
     const userId = (req as any).user.userId;
-    const profile = await prisma.customerProfile.findUnique({ where: { userId } });
+    const profile = await prisma.customerProfile.findUnique({ where: { userId }, include: { group: true } });
     if (!profile) return res.status(404).json({ success: false, message: 'Profile not found.' });
 
     const now = new Date();
@@ -478,14 +565,19 @@ export const getMonthlySummary = async (req: Request, res: Response, next: NextF
       include: { station: true, worker: { select: { fullName: true } } }
     });
 
+    const avgDiscount = transactions.length > 0
+      ? Math.round((transactions.reduce((acc, tx) => acc + (tx.discountPercent || 0), 0) / transactions.length) * 100) / 100
+      : 0;
+
     res.status(200).json({
       success: true,
       data: {
         transactionCount: stats._count.id,
-        totalLitres: stats._sum.litres || 0,
-        totalFuelAmount: stats._sum.amount || 0,
+        totalSpent: stats._sum.finalAmount || 0,
+        totalDiscountAmount: stats._sum.discountAmount || 0,
+        discountPercent: avgDiscount,
         totalFinalAmount: stats._sum.finalAmount || 0,
-        transactions
+        transactions: formatTransactions(transactions, profile?.group?.name)
       }
     });
   } catch (error) {
@@ -497,7 +589,7 @@ export const getMonthlySummary = async (req: Request, res: Response, next: NextF
 export const getYearlySummary = async (req: Request, res: Response, next: NextFunction) => {
   try {
     const userId = (req as any).user.userId;
-    const profile = await prisma.customerProfile.findUnique({ where: { userId } });
+    const profile = await prisma.customerProfile.findUnique({ where: { userId }, include: { group: true } });
     if (!profile) return res.status(404).json({ success: false, message: 'Profile not found.' });
 
     const now = new Date();
@@ -523,14 +615,19 @@ export const getYearlySummary = async (req: Request, res: Response, next: NextFu
       include: { station: true, worker: { select: { fullName: true } } }
     });
 
+    const avgDiscount = transactions.length > 0
+      ? Math.round((transactions.reduce((acc, tx) => acc + (tx.discountPercent || 0), 0) / transactions.length) * 100) / 100
+      : 0;
+
     res.status(200).json({
       success: true,
       data: {
         transactionCount: stats._count.id,
-        totalLitres: stats._sum.litres || 0,
-        totalFuelAmount: stats._sum.amount || 0,
+        totalSpent: stats._sum.finalAmount || 0,
+        totalDiscountAmount: stats._sum.discountAmount || 0,
+        discountPercent: avgDiscount,
         totalFinalAmount: stats._sum.finalAmount || 0,
-        transactions
+        transactions: formatTransactions(transactions, profile?.group?.name)
       }
     });
   } catch (error) {
@@ -542,7 +639,7 @@ export const getYearlySummary = async (req: Request, res: Response, next: NextFu
 export const getTransactions = async (req: Request, res: Response, next: NextFunction) => {
   try {
     const userId = (req as any).user.userId;
-    const profile = await prisma.customerProfile.findUnique({ where: { userId } });
+    const profile = await prisma.customerProfile.findUnique({ where: { userId }, include: { group: true } });
     if (!profile) return res.status(404).json({ success: false, message: 'Profile not found.' });
 
     const filterType = req.query.filterType as string || 'TODAY';
@@ -576,7 +673,7 @@ export const getTransactions = async (req: Request, res: Response, next: NextFun
 
     res.status(200).json({
       success: true,
-      data: { transactions }
+      data: { transactions: formatTransactions(transactions, profile?.group?.name) }
     });
   } catch (error) {
     next(error);
@@ -589,17 +686,21 @@ export const getTransactionById = async (req: Request, res: Response, next: Next
     const userId = (req as any).user.userId;
     const transactionId = String(req.params.id);
 
-    const profile = await prisma.customerProfile.findUnique({ where: { userId } });
+    const profile = await prisma.customerProfile.findUnique({ where: { userId }, include: { group: true } });
     if (!profile) return res.status(404).json({ success: false, message: 'Profile not found.' });
 
     const transaction = await prisma.transaction.findFirst({
       where: {
-        id: transactionId,
+        OR: [
+          { id: transactionId },
+          { customId: transactionId }
+        ],
         customerId: profile.id
       },
       include: {
         station: { select: { name: true, latitude: true, longitude: true } },
-        worker: { select: { fullName: true } }
+        worker: { select: { fullName: true, customId: true } },
+        customer: { select: { id: true, customId: true, fullName: true } }
       }
     });
 
@@ -607,9 +708,40 @@ export const getTransactionById = async (req: Request, res: Response, next: Next
       return res.status(404).json({ success: false, message: 'Transaction not found.' });
     }
 
+    const txCustomId = transaction.customId || formatTransactionId(1);
+    const custCustomId = profile.customId || profile.id || formatCustomerId(1);
+    const wrkCustomId = transaction.worker?.customId || 'WRK001';
+
     res.status(200).json({
       success: true,
-      data: transaction
+      data: {
+        ...transaction,
+        customId: txCustomId,
+        displayId: txCustomId,
+        transactionId: txCustomId,
+        transactionCode: txCustomId,
+        receiptNo: txCustomId,
+        customerId: custCustomId,
+        customerCustomId: custCustomId,
+        customerDisplayId: custCustomId,
+        customerCode: custCustomId,
+        customerName: profile.fullName,
+        customer: {
+          id: profile.id,
+          uuid: profile.id,
+          customId: custCustomId,
+          customerId: custCustomId,
+          displayId: custCustomId,
+          fullName: profile.fullName
+        },
+        workerId: wrkCustomId,
+        workerName: transaction.worker?.fullName || 'Worker',
+        groupName: profile.group?.name || 'Standard Group',
+        discountPercent: transaction.discountPercent || 0,
+        discountPercentage: transaction.discountPercent || 0,
+        fuelTotal: transaction.amount,
+        originalAmount: transaction.amount
+      }
     });
   } catch (error) {
     console.error('[getTransactionById] Error:', error);

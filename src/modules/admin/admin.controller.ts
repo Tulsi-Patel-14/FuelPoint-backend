@@ -1,11 +1,13 @@
+import prisma from '../../utils/prisma';
 import { Request, Response, NextFunction } from 'express';
-import { PrismaClient } from '@prisma/client';
+
 import { generateTokens } from '../../utils/jwt';
 import bcrypt from 'bcrypt';
+import { generateNextWorkerId, generateNextCustomerId } from '../../utils/idGenerator';
+
 import crypto from 'crypto';
 import { sendPasswordResetEmail } from '../../utils/email';
 
-const prisma = new PrismaClient();
 
 // In-memory rate limiting map for forgot password requests (max 5 requests per 15 mins per IP/email)
 const resetRateLimitMap = new Map<string, { count: number; firstRequest: number }>();
@@ -101,13 +103,13 @@ export const forgotPassword = async (req: Request, res: Response, next: NextFunc
     }
 
     // 1. Invalidate any existing unused reset tokens for this user
-    await prisma.passwordResetToken.updateMany({
+    await (prisma as any).passwordResetToken.updateMany({
       where: { userId: user.id, usedAt: null },
       data: { usedAt: new Date() }
     });
 
     // 2. Clean up expired tokens
-    await prisma.passwordResetToken.deleteMany({
+    await (prisma as any).passwordResetToken.deleteMany({
       where: { expiresAt: { lt: new Date() } }
     });
 
@@ -121,7 +123,7 @@ export const forgotPassword = async (req: Request, res: Response, next: NextFunc
     const expiresMinutes = parseInt(process.env.PASSWORD_RESET_TOKEN_EXPIRES_MINUTES || '30', 10);
     const expiresAt = new Date(Date.now() + expiresMinutes * 60 * 1000);
 
-    await prisma.passwordResetToken.create({
+    await (prisma as any).passwordResetToken.create({
       data: {
         userId: user.id,
         tokenHash,
@@ -174,7 +176,7 @@ export const resetPassword = async (req: Request, res: Response, next: NextFunct
     // Hash supplied raw token to match against database hash
     const tokenHash = crypto.createHash('sha256').update(token.trim()).digest('hex');
 
-    const tokenRecord = await prisma.passwordResetToken.findUnique({
+    const tokenRecord = await (prisma as any).passwordResetToken.findUnique({
       where: { tokenHash },
       include: { user: true }
     });
@@ -205,12 +207,12 @@ export const resetPassword = async (req: Request, res: Response, next: NextFunct
         where: { id: user.id },
         data: { password: hashedPassword }
       }),
-      prisma.passwordResetToken.update({
+      (prisma as any).passwordResetToken.update({
         where: { id: tokenRecord.id },
         data: { usedAt: now }
       }),
       // Invalidate any other outstanding reset tokens for this user
-      prisma.passwordResetToken.updateMany({
+      (prisma as any).passwordResetToken.updateMany({
         where: { userId: user.id, usedAt: null, id: { not: tokenRecord.id } },
         data: { usedAt: now }
       })
@@ -239,7 +241,7 @@ export const verifyResetToken = async (req: Request, res: Response, next: NextFu
 
     const tokenHash = crypto.createHash('sha256').update(rawToken.trim()).digest('hex');
 
-    const tokenRecord = await prisma.passwordResetToken.findUnique({
+    const tokenRecord = await (prisma as any).passwordResetToken.findUnique({
       where: { tokenHash },
       include: { user: true }
     });
@@ -449,7 +451,7 @@ export const getDashboard = async (req: Request, res: Response, next: NextFuncti
       .map((w) => ({
         id: w.id,
         name: w.fullName ? w.fullName.split(' ')[0] : 'Worker',
-        scans: w.scans,
+        scans: Math.max(w.scans || 0, w.transactions.length),
         transactions: w.transactions.length,
         discountProcessed: w.transactions.reduce((s, t) => s + (t.discountAmount || 0), 0)
       }))
@@ -670,6 +672,7 @@ export const getWorkers = async (req: Request, res: Response, next: NextFunction
       }
       return {
         ...w,
+        scans: Math.max(w.scans || 0, txns.length),
         transactions: txns.length,
         discountProcessed: discount,
         customersScanned: customers,
@@ -677,7 +680,7 @@ export const getWorkers = async (req: Request, res: Response, next: NextFunction
       };
     };
 
-    const isComputedSort = ['discount', 'customers', 'last', 'lastactivity'].includes(sortField);
+    const isComputedSort = ['discount', 'customers', 'last', 'lastactivity', 'scans'].includes(sortField);
 
     let workers: any[] = [];
     let total = 0;
@@ -705,6 +708,9 @@ export const getWorkers = async (req: Request, res: Response, next: NextFunction
         } else if (sortField === 'customers') {
           valA = a.customersScanned || 0;
           valB = b.customersScanned || 0;
+        } else if (sortField === 'scans') {
+          valA = a.scans || 0;
+          valB = b.scans || 0;
         } else if (sortField === 'last' || sortField === 'lastactivity') {
           valA = new Date(a.lastActivity).getTime();
           valB = new Date(b.lastActivity).getTime();
@@ -767,7 +773,7 @@ export const getWorkers = async (req: Request, res: Response, next: NextFunction
 
 export const getWorkersSummary = async (req: Request, res: Response, next: NextFunction) => {
   try {
-    const [totalWorkers, activeWorkers, scansAgg, discountAgg] = await Promise.all([
+    const [totalWorkers, activeWorkers, scansAgg, discountAgg, totalTxnsCount] = await Promise.all([
       prisma.workerProfile.count({
         where: { isDeleted: false }
       }),
@@ -781,15 +787,20 @@ export const getWorkersSummary = async (req: Request, res: Response, next: NextF
       prisma.transaction.aggregate({
         where: { status: 'COMPLETED', worker: { isDeleted: false } },
         _sum: { discountAmount: true }
+      }),
+      prisma.transaction.count({
+        where: { status: 'COMPLETED', worker: { isDeleted: false } }
       })
     ]);
+
+    const totalScans = Math.max(scansAgg._sum.scans || 0, totalTxnsCount);
 
     res.status(200).json({
       success: true,
       data: {
         totalWorkers,
         activeWorkers,
-        totalScans: scansAgg._sum.scans || 0,
+        totalScans,
         discountProcessed: discountAgg._sum.discountAmount || 0,
       }
     });
@@ -836,6 +847,8 @@ export const createWorker = async (req: Request, res: Response, next: NextFuncti
       stationConnect = { connect: { id: stationId.trim() } };
     }
 
+    const customId = await generateNextWorkerId(prisma, workerFullName);
+
     const user = await prisma.user.create({
       data: {
         email: cleanEmail,
@@ -845,10 +858,11 @@ export const createWorker = async (req: Request, res: Response, next: NextFuncti
         status: status ? status.toUpperCase() : 'ACTIVE',
         workerProfile: {
           create: {
+            customId,
             fullName: workerFullName,
             shift: shift || 'Morning',
             ...(stationConnect && { station: stationConnect })
-          }
+          } as any
         }
       },
       include: {
@@ -1171,7 +1185,7 @@ export const getProfile = async (req: any, res: Response, next: NextFunction) =>
         role: user.role,
         location: user.adminProfile.location ?? '',
         joinedAt: (user as any).createdAt ?? new Date().toISOString(),
-        profileImage: user.adminProfile.profilePhoto ?? null,
+        profileImage: (user.adminProfile as any).profilePhoto ?? null,
         initials: user.adminProfile.fullName
           .split(' ')
           .map((n: string) => n[0])
@@ -1228,7 +1242,7 @@ export const updateProfile = async (req: any, res: Response, next: NextFunction)
             fullName: name !== undefined ? name : undefined,
             location: location !== undefined ? location : undefined,
             profilePhoto: profileImage !== undefined ? profileImage : undefined
-          }
+          } as any
         }
       }
     });
@@ -1248,7 +1262,7 @@ export const updateProfile = async (req: any, res: Response, next: NextFunction)
         role: updatedUser!.role,
         location: updatedUser!.adminProfile!.location ?? '',
         joinedAt: (updatedUser as any).createdAt ?? new Date().toISOString(),
-        profileImage: updatedUser!.adminProfile!.profilePhoto ?? null,
+        profileImage: (updatedUser!.adminProfile as any).profilePhoto ?? null,
         initials: updatedUser!.adminProfile!.fullName
           .split(' ')
           .map((n: string) => n[0])
@@ -1324,7 +1338,7 @@ export const uploadProfileImage = async (req: any, res: Response, next: NextFunc
         adminProfile: {
           update: {
             profilePhoto: fileUrl
-          }
+          } as any
         }
       }
     });
@@ -1412,16 +1426,19 @@ export const createCustomer = async (req: Request, res: Response, next: NextFunc
         groupConnect = { connect: { id: groupId.trim() } };
       }
 
+      const customId = await generateNextCustomerId(prisma);
+
       const user = await prisma.user.create({
         data: {
           email: cleanEmail, mobile: cleanMobile, password: hashedPassword, role: 'CUSTOMER', status: userStatus as any,
           customerProfile: {
             create: {
+              customId,
               fullName: customerFullName,
               vehicle: vehicle !== undefined ? vehicle : undefined,
               address: address !== undefined ? address : undefined,
               ...(groupConnect && { group: groupConnect })
-            }
+            } as any
           }
         },
         include: { customerProfile: { include: { group: true, user: true } } }

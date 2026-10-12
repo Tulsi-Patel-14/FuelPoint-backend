@@ -69,6 +69,7 @@ model Group {
 
 model CustomerProfile {
   id           String   @id @default(uuid())
+  customId     String?  @unique
   userId       String   @unique
   user         User     @relation(fields: [userId], references: [id])
   fullName     String
@@ -86,6 +87,7 @@ model CustomerProfile {
 
 model WorkerProfile {
   id        String   @id @default(uuid())
+  customId  String?  @unique
   userId    String   @unique
   user      User     @relation(fields: [userId], references: [id])
   fullName  String
@@ -135,6 +137,7 @@ model QRSession {
 
 model Transaction {
   id              String            @id @default(uuid())
+  customId        String?           @unique
   customerId      String
   customer        CustomerProfile   @relation(fields: [customerId], references: [id])
   workerId        String
